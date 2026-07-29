@@ -46,24 +46,39 @@ async def ingest_and_index(
         model_code=model_code,
     )
 
-    # 记录入库开始
+    # 幂等：同名文档复用旧记录，避免 doc_id 唯一索引冲突
     doc_id, job_id = None, None
     if db:
-        doc = KnowledgeDoc(
-            doc_id="", doc_name=doc_name, doc_type=doc_type,
-            category=category or None,
-            business_line=business_line or None,
-            model_code=model_code or None,
-            chunk_strategy=chunk_strategy,
-            status="ingesting",
+        result = await db.execute(
+            select(KnowledgeDoc).where(KnowledgeDoc.doc_name == doc_name)
         )
-        db.add(doc)
-        await db.flush()
+        existing = result.scalar_one_or_none()
+        if existing:
+            existing.doc_type = doc_type
+            existing.category = category or None
+            existing.business_line = business_line or None
+            existing.model_code = model_code or None
+            existing.chunk_strategy = chunk_strategy
+            existing.status = "ingesting"
+            await db.flush()
+            doc_id = str(existing.id)
+        else:
+            doc = KnowledgeDoc(
+                doc_id="", doc_name=doc_name, doc_type=doc_type,
+                category=category or None,
+                business_line=business_line or None,
+                model_code=model_code or None,
+                chunk_strategy=chunk_strategy,
+                status="ingesting",
+            )
+            db.add(doc)
+            await db.flush()
+            doc_id = str(doc.id)
 
         job = DocIngestJob(doc_id="", stage="parse", progress=0, parser=parser)
         db.add(job)
         await db.flush()
-        doc_id, job_id = str(doc.id), str(job.id)
+        job_id = str(job.id)
 
     try:
         result_doc_id = await pipeline.ingest(file_path, meta)

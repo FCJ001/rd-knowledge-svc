@@ -52,7 +52,7 @@ async def search_docs_raw(
             collection_name=COLLECTION_NAME,
             data=[query_vec],
             limit=top_k,
-            output_fields=["doc_name", "doc_type", "page_number", "chunk_index", "text"],
+            output_fields=["doc_name", "doc_type", "page_number", "chunk_index", "text", "parent_text", "image_urls"],
             anns_field="embedding",
             search_params={"metric_type": "COSINE", "params": {"nprobe": 16}},
             filter=filter_expr,
@@ -84,14 +84,38 @@ async def search_docs_raw(
 
 
 def format_doc_context(hits: list[dict]) -> str:
-    """格式化检索结果为 LLM 可读上下文"""
+    """格式化检索结果为 LLM 可读上下文。
+    parent_child 策略时优先使用 parent_text（完整父块），
+    否则使用 text（子块）。"""
     if not hits:
         return ""
     parts = []
     for i, hit in enumerate(hits, 1):
         source = f"[{hit['doc_name']}, 第{hit.get('page_number', '?')}页]"
-        parts.append(f"片段{i} {source}:\n{hit['text']}")
+        # parent_child 策略：用父块完整内容
+        text = hit.get("parent_text") or hit["text"]
+        parts.append(f"片段{i} {source}:\n{text}")
     return "\n\n---\n\n".join(parts)
+
+
+def extract_image_urls(hits: list[dict]) -> list[str]:
+    """从检索结果中提取所有图片 URL（去重）"""
+    import json
+    urls = []
+    seen = set()
+    for hit in hits:
+        raw = hit.get("image_urls", "")
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            for url in parsed:
+                if url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return urls
 
 
 async def search_docs(

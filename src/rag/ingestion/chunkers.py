@@ -4,12 +4,31 @@
 # ============================================================
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.embeddings import DashScopeEmbeddings
+from langchain_core.embeddings import Embeddings
 
+from src.core.config import get_settings
 from src.rag.config import ChunkingConfig
+
+
+class TruncatingEmbeddings(Embeddings):
+    """包装 embedding model，自动截断超长文本，避免 DashScope 8192 token 限制"""
+
+    MAX_CHARS: ClassVar[int] = 6000
+
+    def __init__(self, base: Embeddings):
+        self._base = base
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        truncated = [t[:self.MAX_CHARS] if len(t) > self.MAX_CHARS else t for t in texts]
+        return self._base.embed_documents(truncated)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._base.embed_query(text[:self.MAX_CHARS] if len(text) > self.MAX_CHARS else text)
 
 
 @dataclass
@@ -37,7 +56,7 @@ class FixedChunker:
 class SemanticChunkerWrapper:
     def __init__(self, embedding_model: DashScopeEmbeddings, breakpoint_threshold: float = 0.3):
         self.chunker = SemanticChunker(
-            embeddings=embedding_model,
+            embeddings=TruncatingEmbeddings(embedding_model),
             breakpoint_threshold_type="percentile",
             breakpoint_threshold_amount=breakpoint_threshold,
         )
@@ -81,6 +100,11 @@ class ParentChildChunker:
 
 def get_chunker(config: ChunkingConfig, embedding_model: DashScopeEmbeddings = None):
     if config.strategy == "semantic":
+        if embedding_model is None:
+            embedding_model = DashScopeEmbeddings(
+                model=get_settings().EMBEDDING_MODEL,
+                dashscope_api_key=get_settings().DASHSCOPE_API_KEY,
+            )
         return SemanticChunkerWrapper(embedding_model)
     elif config.strategy == "parent_child":
         return ParentChildChunker(config)

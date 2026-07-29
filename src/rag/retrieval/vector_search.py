@@ -18,7 +18,7 @@ async def vector_search(
         data=[embedding],
         anns_field="embedding",
         limit=top_k,
-        output_fields=["text", "doc_name", "doc_type", "category", "chunk_index", "page_number"],
+        output_fields=["text", "doc_name", "doc_type", "category", "chunk_index", "page_number", "parent_text", "image_urls"],
         filter=filter_expr,
         search_params={"metric_type": "COSINE", "params": {"nprobe": 16}},
     )
@@ -26,11 +26,13 @@ async def vector_search(
     for hit in results[0]:
         hits.append({
             "text": hit["entity"]["text"],
+            "parent_text": hit["entity"].get("parent_text", ""),
             "doc_name": hit["entity"]["doc_name"],
             "doc_type": hit["entity"]["doc_type"],
             "score": hit["distance"],
             "chunk_index": hit["entity"]["chunk_index"],
             "page_number": hit["entity"].get("page_number", 0),
+            "image_urls": hit["entity"].get("image_urls", ""),
         })
     return hits
 

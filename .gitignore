@@ -21,3 +21,6 @@ logs/
 .idea/
 .vscode/
 .DS_Store
+
+# 文档
+docs/

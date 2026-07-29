@@ -1,6 +1,6 @@
 # ============================================================
 # Dense + BM25 Sparse 混合检索，RRF(k=60) 融合
-# ★ 接通 hybrid：ingestion pipeline 已生产 sparse_embedding
+# ★ 与天宫医疗一致：sparse 向量由 Milvus 2.6 内置 BM25 Function 自动生成
 # ============================================================
 
 from pymilvus import AnnSearchRequest, MilvusClient, RRFRanker
@@ -14,7 +14,7 @@ async def hybrid_search(
     top_k: int = 20,
     filters: dict | None = None,
 ) -> list[dict]:
-    filter_expr = _build_filter(filters) if filters else None
+    filter_expr = _build_filter(filters) if filters else ""
 
     dense_req = AnnSearchRequest(
         data=[dense_embedding],
@@ -26,7 +26,7 @@ async def hybrid_search(
     sparse_req = AnnSearchRequest(
         data=[query_text],
         anns_field="sparse_embedding",
-        param={"metric_type": "IP"},
+        param={"metric_type": "BM25"},
         limit=top_k,
         expr=filter_expr,
     )
@@ -36,8 +36,7 @@ async def hybrid_search(
         reqs=[dense_req, sparse_req],
         ranker=RRFRanker(k=60),
         limit=top_k,
-        output_fields=["text", "doc_name", "doc_type", "category",
-                       "chunk_index", "page_number", "parent_text"],
+        output_fields=["text", "doc_name", "doc_type", "category", "chunk_index", "parent_text", "image_urls"],
     )
 
     hits = []
@@ -49,7 +48,7 @@ async def hybrid_search(
             "doc_type": hit["entity"]["doc_type"],
             "score": hit["distance"],
             "chunk_index": hit["entity"]["chunk_index"],
-            "page_number": hit["entity"].get("page_number", 0),
+            "image_urls": hit["entity"].get("image_urls", ""),
         })
     return hits
 

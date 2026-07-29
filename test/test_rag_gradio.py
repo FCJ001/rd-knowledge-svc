@@ -9,6 +9,8 @@ import asyncio
 import os
 import sys
 import json
+import tempfile
+from io import BytesIO
 
 # 确保项目根目录在 sys.path 中
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,12 +19,15 @@ import gradio as gr
 from dotenv import load_dotenv
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_openai import ChatOpenAI
+from loguru import logger
+from PIL import Image
 
 from src.core.config import get_settings
 from src.infra.db import AsyncSessionLocal
 from src.infra.db_readonly import ReadOnlySessionLocal
 from src.infra.milvus_client import get_milvus_client
 from src.infra.neo4j_client import get_neo4j_driver
+from src.infra.minio_client import download_file
 
 load_dotenv()
 settings = get_settings()
@@ -50,9 +55,10 @@ def _get_embedding_model():
 
 async def _knowledge_search(question: str, channels: list, role: str):
     if not question.strip():
-        return "请输入问题", ""
+        return "请输入问题", "", []
 
     from src.knowledge.fusion import multi_channel_search
+    from src.knowledge.doc_rag import extract_image_urls, search_docs_raw
 
     llm = _get_llm()
     embedding_model = _get_embedding_model()
@@ -73,8 +79,31 @@ async def _knowledge_search(question: str, channels: list, role: str):
             role=role,
         )
 
+    # ★ 单独查文档获取图片 URL，下载到本地转为 PIL Image
+    image_list = []
+    if "doc_rag" in selected_channels:
+        try:
+            doc_hits = await search_docs_raw(
+                question, embedding_model, milvus_client, top_k=10, rerank_top_k=5,
+            )
+            image_urls = extract_image_urls(doc_hits)
+            for url in image_urls:
+                try:
+                    # URL 格式: http://localhost:9000/knowledge-docs/images/{doc_id}/{filename}
+                    # 从 URL 提取 object_name
+                    parts = url.split(f"{settings.MINIO_BUCKET}/", 1)
+                    if len(parts) == 2:
+                        object_name = parts[1]
+                        img_bytes = download_file(object_name)
+                        pil_img = Image.open(BytesIO(img_bytes))
+                        image_list.append((pil_img, os.path.basename(object_name)))
+                except Exception as e:
+                    logger.warning(f"图片加载失败 {url}: {e}")
+        except Exception as e:
+            logger.warning(f"图片提取失败: {e}")
+
     debug = f"通道: {', '.join(selected_channels)}\n角色: {role}"
-    return answer, debug
+    return answer, debug, image_list
 
 
 def knowledge_search_handler(question, doc_rag, graph_rag, nl2sql, role):
@@ -86,7 +115,7 @@ def knowledge_search_handler(question, doc_rag, graph_rag, nl2sql, role):
     if nl2sql:
         channels.append("nl2sql")
     if not channels:
-        return "请至少选择一个检索通道", ""
+        return "请至少选择一个检索通道", "", []
     return asyncio.run(_knowledge_search(question, channels, role))
 
 
@@ -277,10 +306,11 @@ with gr.Blocks(title="研发知识库 — 功能测试") as demo:
             with gr.Column(scale=3):
                 ks_answer = gr.Textbox(label="回答", lines=12)
                 ks_debug = gr.Textbox(label="调试信息", lines=3)
+                ks_images = gr.Gallery(label="相关图片", columns=3, height=300, show_label=True)
         ks_btn.click(
             knowledge_search_handler,
             [ks_question, ks_doc, ks_graph, ks_nl2sql, ks_role],
-            [ks_answer, ks_debug],
+            [ks_answer, ks_debug, ks_images],
         )
 
     # ── Tab 2: NL2SQL / ChatBI ───────────────────────────────────────
