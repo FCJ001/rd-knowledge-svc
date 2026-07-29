@@ -1,0 +1,69 @@
+# ============================================================
+# rd-knowledge-svc 依赖
+#
+# 与项目一 rd-agent-platform 保持版本一致，已验证跑通。
+# 项目二不做 Agent，去掉 langgraph-checkpoint-redis。
+# 新增：sqlglot（AST 层 SQL 注入）、trulens（评测）、aiohttp（MinerU 轮询）
+# ============================================================
+
+# ---------------- Web 框架 ----------------
+fastapi==0.135.1
+uvicorn==0.42.0
+python-multipart==0.0.22
+sse-starlette==3.3.4
+httpx==0.28.1
+
+# ---------------- 配置与日志 ----------------
+pydantic==2.12.5
+pydantic-settings==2.13.1
+python-dotenv==1.2.2
+loguru==0.7.3
+
+# ---------------- PostgreSQL ----------------
+SQLAlchemy==2.0.48
+asyncpg==0.30.0
+greenlet==3.3.2
+alembic==1.18.4
+psycopg2-binary==2.9.11
+
+# ---------------- 测试 ----------------
+pytest==9.0.2
+pytest-asyncio==1.3.0
+
+# ---------------- Neo4j ----------------
+neo4j==5.28.2
+
+# ---------------- Milvus ----------------
+pymilvus==2.6.10
+
+# ---------------- Redis ----------------
+redis==7.3.0
+
+# ---------------- LangChain / LangGraph ----------------
+langchain==1.2.15
+langchain-core==1.2.28
+langchain-community==0.4.1
+langchain-experimental==0.4.1
+langchain-openai==1.1.12
+langchain-deepseek==1.0.1
+langgraph==1.1.6
+langgraph-checkpoint==4.0.1
+langgraph-prebuilt==1.0.9
+dashscope==1.25.16
+
+# ---------------- MinIO + 文档解析 ----------------
+minio==7.2.18
+pypdf==6.10.0
+pandas==2.3.3
+
+# ---------------- NL2SQL（AST 层 SQL 注入）----------------
+sqlglot==26.17.0
+
+# ---------------- 评测（TruLens）----------------
+trulens==1.4.6
+
+# ---------------- MinerU 轮询 ----------------
+aiohttp==3.13.3
+
+# ---------------- JWT ----------------
+PyJWT==2.10.1
