@@ -31,6 +31,7 @@ async def multi_channel_search(
     db_session: AsyncSession | None = None,
     channels: list[str] | None = None,
     role: str = "engineer",
+    use_hyde: bool = False,
 ) -> str:
     """
     多通道并行检索 → 结果融合 → 幻觉检测 → 返回最终回答。
@@ -40,7 +41,10 @@ async def multi_channel_search(
 
     tasks = {}
     if "doc_rag" in channels:
-        tasks["doc_rag"] = search_docs_raw(question, embedding_model, milvus_client)
+        tasks["doc_rag"] = search_docs_raw(
+            question, embedding_model, milvus_client,
+            llm=llm, use_hyde=use_hyde,
+        )
     if "graph_rag" in channels:
         tasks["graph_rag"] = search_graph_raw(question, neo4j_driver, llm)
     if "nl2sql" in channels and db_session:
