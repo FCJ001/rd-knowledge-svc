@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RD Knowledge — 研发知识库</title>
+<style>
+/* ══════════════════════════════════════════════════════════════
+   Design Tokens — 深岩蓝主色
+   ══════════════════════════════════════════════════════════════ */
+:root {
+  --primary: #1E6FFF;
+  --primary-hover: #1556CC;
+  --primary-light: #EBF3FF;
+  --danger: #E32219;
+  --danger-light: #FEF2F2;
+  --warning: #F59E0B;
+  --warning-light: #FFFBEB;
+  --success: #10B981;
+  --success-light: #ECFDF5;
+
+  --title: #111827;
+  --body: #374151;
+  --muted: #6B7280;
+  --border: #E5E7EB;
+  --bg: #F9FAFB;
+  --card: #FFFFFF;
+  --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans SC", sans-serif;
+  --mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+}
+
+[data-theme="dark"] {
+  --primary: #3B8CFF;
+  --primary-hover: #5CA0FF;
+  --primary-light: #1E3050;
+  --title: #F9FAFB;
+  --body: #D1D5DB;
+  --muted: #9CA3AF;
+  --border: #374151;
+  --bg: #0F172A;
+  --card: #1E293B;
+  --shadow: 0 1px 3px rgba(0,0,0,.3);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Reset & Base
+   ══════════════════════════════════════════════════════════════ */
+*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+html, body { height:100%; overflow:hidden; }
+body {
+  font-family: var(--font);
+  font-size: 14px; color: var(--body); background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Shell — Sidebar + Main
+   ══════════════════════════════════════════════════════════════ */
+.shell { display:flex; height:100vh; }
+
+/* ── Top Bar ── */
+.topbar {
+  position:fixed; top:0; left:0; right:0; z-index:100;
+  height:52px; background:var(--card); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; padding:0 20px; gap:16px;
+}
+.topbar .logo { font-size:16px; font-weight:700; color:var(--title); white-space:nowrap; }
+.topbar .logo span { font-weight:400; color:var(--muted); }
+.topbar .dot { width:8px; height:8px; border-radius:50%; background:var(--success); flex-shrink:0; }
+.topbar .spacer { flex:1; }
+.topbar .icon-btn { width:34px; height:34px; border:none; border-radius:var(--radius-sm); background:transparent; cursor:pointer; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:18px; }
+.topbar .icon-btn:hover { background:var(--bg); color:var(--title); }
+.topbar select { font-size:13px; padding:4px 10px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--card); color:var(--body); cursor:pointer; }
+
+/* ── Sidebar ── */
+.sidebar {
+  width:260px; min-width:260px; background:var(--card); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; margin-top:52px; height:calc(100vh - 52px);
+}
+.sidebar .nav-section { padding:12px 12px 8px; }
+.sidebar .nav-item {
+  display:flex; align-items:center; gap:10px; padding:10px 14px; border-radius:var(--radius-sm);
+  cursor:pointer; font-size:14px; font-weight:500; color:var(--body); margin-bottom:2px;
+  transition:background .1s;
+}
+.sidebar .nav-item:hover { background:var(--bg); }
+.sidebar .nav-item.active { background:var(--primary-light); color:var(--primary); }
+.sidebar .nav-item .nav-icon { font-size:16px; }
+.sidebar .divider { height:1px; background:var(--border); margin:8px 14px; }
+.sidebar .history-section { flex:1; overflow-y:auto; padding:0 8px 12px; }
+.sidebar .group-label { font-size:11px; font-weight:600; color:var(--muted); padding:10px 8px 4px; text-transform:uppercase; letter-spacing:.04em; }
+.sidebar .history-item {
+  padding:8px 12px; border-radius:var(--radius-sm); cursor:pointer; margin-bottom:2px;
+  font-size:13px; color:var(--body); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  transition:background .1s;
+}
+.sidebar .history-item:hover { background:var(--bg); }
+
+/* ── Main Content Area ── */
+.main {
+  flex:1; display:flex; flex-direction:column; margin-top:52px; height:calc(100vh - 52px);
+  min-width:0; background:var(--bg); overflow-y:auto;
+}
+.page { display:none; padding:32px 40px; max-width:960px; margin:0 auto; width:100%; }
+.page.active { display:block; }
+
+/* ══════════════════════════════════════════════════════════════
+   Search Page
+   ══════════════════════════════════════════════════════════════ */
+.search-hero { text-align:center; padding:40px 0 24px; }
+.search-hero h2 { font-size:22px; color:var(--title); margin-bottom:4px; }
+.search-hero .subtitle { color:var(--muted); font-size:14px; }
+
+.search-box { position:relative; max-width:680px; margin:0 auto; }
+.search-box textarea {
+  width:100%; resize:none; border:1px solid var(--border); border-radius:var(--radius);
+  padding:14px 48px 14px 18px; font-size:15px; font-family:var(--font); outline:none;
+  min-height:52px; max-height:120px; background:var(--card); color:var(--title);
+  box-shadow:var(--shadow);
+}
+.search-box textarea:focus { border-color:var(--primary); box-shadow:0 0 0 3px var(--primary-light); }
+.search-box .search-btn {
+  position:absolute; right:8px; bottom:8px; width:36px; height:36px; border:none;
+  border-radius:50%; background:var(--primary); color:#fff; cursor:pointer; font-size:18px;
+  display:flex; align-items:center; justify-content:center; transition:background .15s;
+}
+.search-box .search-btn:hover { background:var(--primary-hover); }
+.search-box .search-btn:disabled { background:var(--border); cursor:not-allowed; }
+
+.search-opts { display:flex; gap:16px; margin:12px auto 0; max-width:680px; flex-wrap:wrap; align-items:center; }
+.search-opts label { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:4px; cursor:pointer; }
+.search-opts label input[type=checkbox] { accent-color:var(--primary); }
+.search-opts select, .search-opts input[type=text] {
+  font-size:12px; padding:4px 8px; border:1px solid var(--border); border-radius:var(--radius-sm);
+  background:var(--card); color:var(--body); outline:none;
+}
+.search-opts select:focus, .search-opts input[type=text]:focus { border-color:var(--primary); }
+
+/* Result card */
+.result-card {
+  background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+  padding:24px; margin-top:20px; animation:fadeUp .3s ease;
+}
+@keyframes fadeUp { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+.result-card .rc-header { display:flex; align-items:center; gap:8px; margin-bottom:14px; }
+.result-card .channel-tag {
+  display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:500;
+  background:var(--primary-light); color:var(--primary);
+}
+.result-card .rc-body { line-height:1.8; }
+.result-card .rc-body h1,.result-card .rc-body h2,.result-card .rc-body h3 { font-size:15px; color:var(--title); margin:10px 0 6px; }
+.result-card .rc-body p { margin:4px 0; }
+.result-card .rc-body strong { color:var(--title); }
+.result-card .rc-body code { font-family:var(--mono); font-size:12px; background:var(--bg); padding:1px 5px; border-radius:3px; }
+.result-card .rc-body ul,.result-card .rc-body ol { margin:6px 0; padding-left:18px; }
+.result-card .rc-body li { margin:3px 0; }
+.result-card .rc-body table { border-collapse:collapse; margin:8px 0; width:100%; }
+.result-card .rc-body th,.result-card .rc-body td { border:1px solid var(--border); padding:6px 10px; font-size:13px; text-align:left; }
+.result-card .rc-body th { background:var(--bg); font-weight:600; }
+.result-card .rc-footer { display:flex; align-items:center; gap:12px; margin-top:16px; padding-top:12px; border-top:1px solid var(--border); }
+.feedback-btn {
+  display:inline-flex; align-items:center; gap:4px; padding:5px 12px; border:1px solid var(--border);
+  border-radius:var(--radius-sm); font-size:12px; cursor:pointer; background:var(--card); color:var(--muted);
+  transition:all .15s;
+}
+.feedback-btn:hover { border-color:var(--primary); color:var(--primary); }
+.feedback-btn.active-thumb { border-color:var(--success); color:var(--success); background:var(--success-light); }
+
+/* ══════════════════════════════════════════════════════════════
+   BI Page
+   ══════════════════════════════════════════════════════════════ */
+.bi-query-bar { display:flex; gap:10px; margin-bottom:20px; }
+.bi-query-bar textarea {
+  flex:1; resize:none; border:1px solid var(--border); border-radius:var(--radius);
+  padding:12px 16px; font-size:14px; font-family:var(--font); outline:none;
+  min-height:44px; max-height:100px; background:var(--card); color:var(--title);
+}
+.bi-query-bar textarea:focus { border-color:var(--primary); box-shadow:0 0 0 3px var(--primary-light); }
+.bi-query-bar .send-btn {
+  width:44px; height:44px; border:none; border-radius:var(--radius-sm); background:var(--primary);
+  color:#fff; cursor:pointer; font-size:18px; flex-shrink:0; transition:background .15s;
+}
+.bi-query-bar .send-btn:hover { background:var(--primary-hover); }
+.bi-query-bar .send-btn:disabled { background:var(--border); cursor:not-allowed; }
+
+.session-row { display:flex; align-items:center; gap:10px; margin-bottom:16px; font-size:13px; color:var(--muted); }
+.session-row input { font-size:12px; padding:3px 8px; border:1px solid var(--border); border-radius:var(--radius-sm); width:120px; background:var(--card); color:var(--body); }
+.session-row .link-btn { background:none; border:none; font-size:12px; color:var(--primary); cursor:pointer; }
+
+.bi-section { margin-bottom:20px; }
+.bi-section .bi-label { font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase; margin-bottom:6px; }
+.bi-section .summary-text { font-size:14px; color:var(--body); line-height:1.7; }
+.bi-section pre {
+  background:var(--card); border:1px solid var(--border); border-radius:var(--radius-sm);
+  padding:14px; font-family:var(--mono); font-size:12px; overflow-x:auto;
+  color:var(--title); position:relative;
+}
+.bi-section .copy-btn {
+  position:absolute; top:6px; right:6px; padding:3px 10px; font-size:11px;
+  border:1px solid var(--border); border-radius:3px; background:var(--bg); cursor:pointer; color:var(--muted);
+}
+.bi-section .copy-btn:hover { color:var(--primary); border-color:var(--primary); }
+
+.bi-table { width:100%; border-collapse:collapse; font-size:13px; }
+.bi-table th { background:var(--bg); font-weight:600; text-align:left; padding:8px 12px; border:1px solid var(--border); color:var(--title); }
+.bi-table td { padding:6px 12px; border:1px solid var(--border); color:var(--body); }
+.bi-table tr:hover td { background:var(--bg); }
+
+.chart-container { width:100%; height:360px; background:var(--card); border:1px solid var(--border); border-radius:var(--radius); }
+
+/* ══════════════════════════════════════════════════════════════
+   Docs Page
+   ══════════════════════════════════════════════════════════════ */
+.docs-toolbar { display:flex; gap:12px; margin-bottom:16px; align-items:center; }
+.docs-toolbar input {
+  flex:1; padding:8px 14px; border:1px solid var(--border); border-radius:var(--radius-sm);
+  font-size:14px; outline:none; background:var(--card); color:var(--title);
+}
+.docs-toolbar input:focus { border-color:var(--primary); }
+.docs-toolbar .upload-btn {
+  padding:8px 20px; background:var(--primary); color:#fff; border:none; border-radius:var(--radius-sm);
+  font-size:14px; font-weight:500; cursor:pointer; transition:background .15s;
+}
+.docs-toolbar .upload-btn:hover { background:var(--primary-hover); }
+
+.doc-table { width:100%; border-collapse:collapse; font-size:13px; }
+.doc-table th { background:var(--bg); font-weight:600; text-align:left; padding:10px 14px; border-bottom:2px solid var(--border); color:var(--title); }
+.doc-table td { padding:10px 14px; border-bottom:1px solid var(--border); color:var(--body); }
+.doc-table tr:hover td { background:var(--card); }
+.doc-table .del-btn { padding:3px 10px; font-size:12px; border:1px solid var(--danger); border-radius:3px; color:var(--danger); background:transparent; cursor:pointer; }
+.doc-table .del-btn:hover { background:var(--danger-light); }
+.status-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; }
+.status-badge.indexed { background:var(--success-light); color:var(--success); }
+.status-badge.processing { background:var(--warning-light); color:var(--warning); }
+.status-badge.failed { background:var(--danger-light); color:var(--danger); }
+
+.pagination { display:flex; gap:6px; margin-top:16px; justify-content:center; align-items:center; }
+.pagination button {
+  padding:6px 12px; border:1px solid var(--border); border-radius:var(--radius-sm);
+  background:var(--card); cursor:pointer; font-size:13px; color:var(--body);
+}
+.pagination button:hover { border-color:var(--primary); color:var(--primary); }
+.pagination button:disabled { opacity:.4; cursor:not-allowed; }
+.pagination .page-num { font-size:13px; color:var(--muted); }
+
+/* ── Upload Modal ── */
+.modal-overlay {
+  display:none; position:fixed; inset:0; z-index:200;
+  background:rgba(0,0,0,.4); align-items:center; justify-content:center;
+}
+.modal-overlay.show { display:flex; }
+.modal-box {
+  background:var(--card); border-radius:var(--radius); padding:28px; width:520px; max-height:80vh; overflow-y:auto;
+  box-shadow:0 20px 60px rgba(0,0,0,.15);
+}
+.modal-box h3 { font-size:17px; color:var(--title); margin-bottom:20px; }
+.modal-box .form-row { margin-bottom:14px; }
+.modal-box .form-label { font-size:13px; font-weight:500; color:var(--title); margin-bottom:4px; display:block; }
+.modal-box .form-input, .modal-box .form-select {
+  width:100%; padding:8px 12px; border:1px solid var(--border); border-radius:var(--radius-sm);
+  font-size:13px; outline:none; background:var(--card); color:var(--title);
+}
+.modal-box .form-input:focus, .modal-box .form-select:focus { border-color:var(--primary); }
+.drop-zone {
+  border:2px dashed var(--border); border-radius:var(--radius); padding:32px; text-align:center;
+  cursor:pointer; transition:border-color .15s; color:var(--muted);
+}
+.drop-zone:hover,.drop-zone.drag-over { border-color:var(--primary); color:var(--primary); }
+.modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:20px; }
+.modal-actions button {
+  padding:8px 22px; border:none; border-radius:var(--radius-sm); font-size:14px; font-weight:500; cursor:pointer;
+}
+.modal-actions .btn-cancel { background:var(--bg); color:var(--body); border:1px solid var(--border); }
+.modal-actions .btn-confirm { background:var(--primary); color:#fff; }
+.modal-actions .btn-confirm:disabled { opacity:.5; cursor:not-allowed; }
+.modal-actions .btn-cancel:hover { background:var(--border); }
+
+.progress-bar { height:6px; background:var(--border); border-radius:3px; overflow:hidden; margin-top:10px; }
+.progress-bar .fill { height:100%; background:var(--primary); border-radius:3px; transition:width .3s; }
+
+/* ══════════════════════════════════════════════════════════════
+   Loading & Messages
+   ══════════════════════════════════════════════════════════════ */
+.loading { text-align:center; padding:40px; color:var(--muted); }
+.spinner { display:inline-block; width:24px; height:24px; border:3px solid var(--border); border-top-color:var(--primary); border-radius:50%; animation:spin .6s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+.empty-state { text-align:center; padding:60px 20px; color:var(--muted); }
+.empty-state .empty-icon { font-size:48px; margin-bottom:12px; }
+
+.toast {
+  position:fixed; top:64px; right:20px; z-index:300; padding:10px 20px; border-radius:var(--radius-sm);
+  font-size:13px; color:#fff; animation:fadeUp .3s ease;
+}
+.toast.success { background:var(--success); }
+.toast.error { background:var(--danger); }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width:6px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+/* ── Responsive ── */
+@media (max-width:768px) { .sidebar { display:none; } .page { padding:20px; } }
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <!-- ═══ Top Bar ═══ -->
+  <div class="topbar">
+    <div class="logo">📚 RD Knowledge <span>· 研发知识库</span></div>
+    <div class="dot" id="statusDot" title="服务状态"></div>
+    <span style="font-size:12px;color:var(--muted)" id="statusText">检测中…</span>
+    <div class="spacer"></div>
+    <select id="roleSelect" onchange="onRoleChange()" title="用户角色">
+      <option value="engineer">🔧 工程师</option>
+      <option value="business">📊 业务</option>
+      <option value="aftersales">🔧 售后</option>
+      <option value="customer">👤 客户</option>
+    </select>
+    <button class="icon-btn" onclick="toggleTheme()" title="切换主题">🌓</button>
+  </div>
+
+  <!-- ═══ Left: Sidebar Navigation ═══ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="nav-section">
+      <div class="nav-item active" data-page="search" onclick="switchPage('search')">
+        <span class="nav-icon">📚</span> 知识检索
+      </div>
+      <div class="nav-item" data-page="bi" onclick="switchPage('bi')">
+        <span class="nav-icon">📈</span> BI 数据分析
+      </div>
+      <div class="nav-item" data-page="docs" onclick="switchPage('docs')">
+        <span class="nav-icon">📁</span> 文档中心
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="history-section" id="historySection">
+      <div class="group-label">📌 搜索历史</div>
+      <div id="historyList"></div>
+    </div>
+  </aside>
+
+  <!-- ═══ Main Content ═══ -->
+  <main class="main">
+
+    <!-- ── 知识检索 ── -->
+    <div class="page active" id="page-search">
+      <div class="search-hero">
+        <h2>研发知识库检索</h2>
+        <p class="subtitle">多通道 RAG 检索 — 文档 · 知识图谱 · NL2SQL</p>
+      </div>
+      <div class="search-box">
+        <textarea id="searchInput" rows="2" placeholder="输入问题，例如：电池健康度SOH低于多少需要更换？" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();doSearch();}"></textarea>
+        <button class="search-btn" id="searchBtn" onclick="doSearch()">➤</button>
+      </div>
+      <div class="search-opts">
+        <label><input type="checkbox" value="doc_rag" checked onchange="store.channels=selectedChannels()"> 文档 RAG</label>
+        <label><input type="checkbox" value="graph_rag" checked onchange="store.channels=selectedChannels()"> 图谱 RAG</label>
+        <label><input type="checkbox" value="nl2sql" onchange="store.channels=selectedChannels()"> NL2SQL</label>
+        <span style="font-size:12px;color:var(--muted)">|</span>
+        <select id="docType" onchange="store.docType=this.value">
+          <option value="">全部文档类型</option>
+          <option value="repair_manual">维修手册</option>
+          <option value="spec_doc">设计规范</option>
+          <option value="tsb">TSB 公告</option>
+          <option value="issue_case">问题案例</option>
+        </select>
+        <input type="text" id="modelCode" placeholder="车型代码" oninput="store.modelCode=this.value" style="width:100px;">
+      </div>
+      <div id="searchResults"></div>
+    </div>
+
+    <!-- ── BI 数据分析 ── -->
+    <div class="page" id="page-bi">
+      <div style="margin-bottom:20px;">
+        <h2 style="font-size:18px;color:var(--title);">BI 数据分析</h2>
+        <p style="color:var(--muted);font-size:13px;">自然语言查询 → SQL → 数据图表</p>
+      </div>
+      <div class="session-row">
+        会话 ID：
+        <input type="text" id="biSessionId" value="default" onchange="store.biSession=this.value">
+        <button class="link-btn" onclick="clearBIHistory()">清除历史</button>
+      </div>
+      <div class="bi-query-bar">
+        <textarea id="biInput" rows="1" placeholder="输入数据查询，例如：最近一个月各域的缺陷密度对比" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();doBIQuery();}"></textarea>
+        <button class="send-btn" id="biSendBtn" onclick="doBIQuery()">➤</button>
+      </div>
+      <div id="biResults"></div>
+    </div>
+
+    <!-- ── 文档中心 ── -->
+    <div class="page" id="page-docs">
+      <div style="margin-bottom:20px;">
+        <h2 style="font-size:18px;color:var(--title);">文档中心</h2>
+        <p style="color:var(--muted);font-size:13px;">管理知识库文档 — 上传、查看、删除</p>
+      </div>
+      <div class="docs-toolbar">
+        <input type="text" id="docSearch" placeholder="搜索文档名称、类型、分类…" oninput="loadDocs()">
+        <button class="upload-btn" onclick="openUploadModal()">+ 上传文档</button>
+      </div>
+      <div id="docTableWrap"></div>
+      <div class="pagination" id="docPagination"></div>
+    </div>
+
+  </main>
+</div>
+
+<!-- Upload Modal -->
+<div class="modal-overlay" id="uploadModal">
+  <div class="modal-box">
+    <h3>📤 上传文档</h3>
+    <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+      <div style="font-size:32px;margin-bottom:8px;">📄</div>
+      <div>拖拽文件到此处，或点击选择文件</div>
+      <div style="font-size:11px;margin-top:4px;">支持 PDF、DOCX、TXT 等格式</div>
+    </div>
+    <input type="file" id="fileInput" style="display:none" onchange="onFileSelected(this.files[0])">
+    <div id="selectedFile" style="font-size:13px;color:var(--primary);margin-top:8px;"></div>
+    <div class="form-row" style="margin-top:14px;">
+      <label class="form-label">文档类型</label>
+      <select class="form-select" id="uploadDocType">
+        <option value="spec_doc">设计规范</option>
+        <option value="repair_manual">维修手册</option>
+        <option value="tsb">TSB 公告</option>
+        <option value="issue_case">问题案例</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label class="form-label">分类</label>
+      <input class="form-input" id="uploadCategory" placeholder="如：底盘、动力电池、智能座舱">
+    </div>
+    <div class="form-row">
+      <label class="form-label">车型代码</label>
+      <input class="form-input" id="uploadModel" placeholder="如：BYD-2025Q3">
+    </div>
+    <div class="form-row">
+      <label class="form-label">分块策略</label>
+      <select class="form-select" id="uploadChunk">
+        <option value="fixed">fixed — 固定大小</option>
+        <option value="semantic">semantic — 语义分块</option>
+        <option value="parent_child">parent_child — 父子分块</option>
+      </select>
+    </div>
+    <div id="uploadProgress" style="font-size:13px;color:var(--muted);"></div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeUploadModal()">取消</button>
+      <button class="btn-confirm" id="uploadConfirmBtn" onclick="doUpload()">上传并入库</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div id="toastContainer"></div>
+
+<script>
+/* ══════════════════════════════════════════════════════════════
+   State
+   ══════════════════════════════════════════════════════════════ */
+const BASE = 'http://localhost:8002';
+const store = {
+  page: 'search',
+  role: localStorage.getItem('rd_knowledge_role')||'engineer',
+  theme: localStorage.getItem('rd_knowledge_theme')||'light',
+  channels: ['doc_rag','graph_rag'],
+  docType: '',
+  modelCode: '',
+  biSession: 'default',
+  lastSearchAnswer: '',    // for feedback
+  lastSearchQuestion: '',
+  lastSearchChannels: '',
+  _uploadFile: null,
+};
+
+/* history lists */
+let searchHistory = JSON.parse(localStorage.getItem('rd_search_history')||'[]');
+let biHistory = JSON.parse(localStorage.getItem('rd_bi_history')||'[]');
+let recentUploads = JSON.parse(localStorage.getItem('rd_recent_uploads')||'[]');
+
+/* ══════════════════════════════════════════════════════════════
+   Init
+   ══════════════════════════════════════════════════════════════ */
+function init() {
+  document.getElementById('roleSelect').value = store.role;
+  if (store.theme === 'dark') document.documentElement.setAttribute('data-theme','dark');
+  checkHealth();
+  renderHistory();
+}
+
+function checkHealth() {
+  fetch(BASE+'/health').then(r=>r.json()).then(d=>{
+    document.getElementById('statusDot').style.background='var(--success)';
+    document.getElementById('statusText').textContent='在线';
+  }).catch(()=>{
+    document.getElementById('statusDot').style.background='var(--danger)';
+    document.getElementById('statusText').textContent='离线';
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Page Switching
+   ══════════════════════════════════════════════════════════════ */
+function switchPage(name) {
+  store.page = name;
+  document.querySelectorAll('.nav-item').forEach(el=>el.classList.toggle('active',el.dataset.page===name));
+  document.querySelectorAll('.page').forEach(el=>el.classList.toggle('active',el.id==='page-'+name));
+  renderHistory();
+  if (name === 'docs') loadDocs();
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Sidebar History
+   ══════════════════════════════════════════════════════════════ */
+function renderHistory() {
+  const section = document.getElementById('historySection');
+  let label, list;
+  if (store.page === 'search') { label='📌 搜索历史'; list=searchHistory; }
+  else if (store.page === 'bi') { label='📌 BI 查询历史'; list=biHistory; }
+  else { label='📌 最近上传'; list=recentUploads; }
+
+  let html = `<div class="group-label">${label}</div>`;
+  if (!list.length) {
+    html += '<div style="font-size:12px;color:var(--muted);padding:8px;">暂无记录</div>';
+  } else {
+    html += list.slice(0,20).map((item,i)=>
+      `<div class="history-item" onclick="${store.page==='search'?`rerunSearch(${i})`:store.page==='bi'?`rerunBI(${i})`:`''`}" title="${escHtml(item)}">${escHtml(item.length>35?item.slice(0,35)+'…':item)}</div>`
+    ).join('');
+  }
+  section.innerHTML = `<div class="group-label">${label}</div>` + html;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Page 1: Knowledge Search
+   ══════════════════════════════════════════════════════════════ */
+function selectedChannels() {
+  return [...document.querySelectorAll('.search-opts input[type=checkbox]:checked')].map(c=>c.value);
+}
+
+async function doSearch() {
+  const input = document.getElementById('searchInput');
+  const q = input.value.trim();
+  if (!q) return;
+  store.channels = selectedChannels();
+  store.lastSearchQuestion = q;
+  store.lastSearchChannels = store.channels.join(',');
+
+  const btn = document.getElementById('searchBtn');
+  btn.disabled = true;
+  document.getElementById('searchResults').innerHTML = '<div class="loading"><div class="spinner"></div><div style="margin-top:12px;">检索中…</div></div>';
+
+  try {
+    const resp = await fetch(BASE+'/api/v1/knowledge/search',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-User-Id':'web','X-User-Role':store.role},
+      body: JSON.stringify({question:q, channels:store.channels, doc_type:store.docType, model_code:store.modelCode})
+    });
+    const json = await resp.json();
+    const data = json.data;
+    store.lastSearchAnswer = data ? data.answer : '';
+
+    // Save to history
+    if (!searchHistory.includes(q)) { searchHistory.unshift(q); if (searchHistory.length>50) searchHistory.pop(); }
+    localStorage.setItem('rd_search_history', JSON.stringify(searchHistory));
+
+    renderSearchResult(q, data);
+    renderHistory();
+  } catch(e) {
+    document.getElementById('searchResults').innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div>请求失败：${escHtml(e.message)}</div>`;
+  }
+  btn.disabled = false;
+}
+
+function renderSearchResult(question, data) {
+  if (!data || !data.answer) {
+    document.getElementById('searchResults').innerHTML = '<div class="empty-state"><div class="empty-icon">🔍</div>未找到相关内容</div>';
+    return;
+  }
+  const channels = data.channels||store.channels;
+  document.getElementById('searchResults').innerHTML = `
+    <div class="result-card">
+      <div class="rc-header">
+        <span style="font-size:13px;font-weight:600;color:var(--title);">${escHtml(question)}</span>
+        <div style="flex:1"></div>
+        ${channels.map(c=>`<span class="channel-tag">${escHtml(c)}</span>`).join('')}
+      </div>
+      <div class="rc-body">${renderMarkdown(data.answer)}</div>
+      <div class="rc-footer">
+        <span style="font-size:12px;color:var(--muted);">回答对你有帮助吗？</span>
+        <button class="feedback-btn" id="fbUp" onclick="submitFeedback(1)">👍 有用</button>
+        <button class="feedback-btn" id="fbDown" onclick="submitFeedback(-1)">👎 无用</button>
+      </div>
+    </div>`;
+  document.getElementById('searchResults').scrollIntoView({behavior:'smooth'});
+}
+
+function rerunSearch(idx) {
+  const q = searchHistory[idx];
+  if (q) { document.getElementById('searchInput').value = q; switchPage('search'); doSearch(); }
+}
+
+async function submitFeedback(rating) {
+  const up = document.getElementById('fbUp');
+  const down = document.getElementById('fbDown');
+  up.classList.toggle('active-thumb', rating===1);
+  down.classList.toggle('active-thumb', rating===-1);
+  try {
+    await fetch(BASE+'/api/v1/knowledge/feedback',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-User-Id':'web','X-User-Role':store.role},
+      body: JSON.stringify({question:store.lastSearchQuestion, answer_preview:store.lastSearchAnswer.slice(0,200), rating, channels:store.lastSearchChannels})
+    });
+    toast('反馈已提交', 'success');
+  } catch(e) { toast('反馈提交失败', 'error'); }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Page 2: BI Query
+   ══════════════════════════════════════════════════════════════ */
+async function doBIQuery() {
+  const input = document.getElementById('biInput');
+  const q = input.value.trim();
+  if (!q) return;
+
+  const btn = document.getElementById('biSendBtn');
+  btn.disabled = true;
+  document.getElementById('biResults').innerHTML = '<div class="loading"><div class="spinner"></div><div style="margin-top:12px;">查询中…</div></div>';
+
+  try {
+    const resp = await fetch(BASE+'/api/v1/bi/query',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-User-Id':'web','X-User-Role':store.role},
+      body: JSON.stringify({question:q, session_id:store.biSession, with_chart:true})
+    });
+    const json = await resp.json();
+    const data = json.data;
+
+    if (!biHistory.includes(q)) { biHistory.unshift(q); if (biHistory.length>50) biHistory.pop(); }
+    localStorage.setItem('rd_bi_history', JSON.stringify(biHistory));
+
+    renderBIResult(data);
+    renderHistory();
+  } catch(e) {
+    document.getElementById('biResults').innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div>请求失败：${escHtml(e.message)}</div>`;
+  }
+  btn.disabled = false;
+}
+
+function renderBIResult(data) {
+  if (!data || !data.success) {
+    document.getElementById('biResults').innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div>${escHtml(data?.error||'查询失败')}</div>`;
+    return;
+  }
+
+  let html = '';
+
+  // Summary
+  if (data.summary) {
+    html += `<div class="bi-section"><div class="bi-label">📋 摘要</div><div class="summary-text">${renderMarkdown(data.summary)}</div></div>`;
+  }
+
+  // SQL
+  if (data.sql) {
+    html += `<div class="bi-section"><div class="bi-label">💾 SQL</div><pre style="position:relative"><button class="copy-btn" onclick="copyText(this,'${escHtml(data.sql).replace(/'/g,"\\'")}')">复制</button>${escHtml(data.sql)}</pre></div>`;
+  }
+
+  // Data table
+  if (data.data && data.data.length) {
+    const cols = data.columns || Object.keys(data.data[0]);
+    html += `<div class="bi-section"><div class="bi-label">📊 数据 (${data.row_count} 行)</div><div style="overflow-x:auto"><table class="bi-table"><thead><tr>${cols.map(c=>`<th>${escHtml(c)}</th>`).join('')}</tr></thead><tbody>`;
+    html += data.data.map(row=>`<tr>${cols.map(c=>`<td>${escHtml(String(row[c]??''))}</td>`).join('')}</tr>`).join('');
+    html += '</tbody></table></div></div>';
+  }
+
+  // Chart
+  if (data.chart) {
+    html += `<div class="bi-section"><div class="bi-label">📈 图表</div><div class="chart-container" id="biChart"></div></div>`;
+  }
+
+  document.getElementById('biResults').innerHTML = html;
+
+  // Render chart
+  if (data.chart) {
+    setTimeout(()=>{
+      const el = document.getElementById('biChart');
+      if (el && typeof echarts !== 'undefined') {
+        const chart = echarts.init(el);
+        chart.setOption(data.chart);
+        window.addEventListener('resize', ()=>chart.resize());
+      }
+    }, 100);
+  }
+}
+
+function rerunBI(idx) {
+  const q = biHistory[idx];
+  if (q) { document.getElementById('biInput').value = q; switchPage('bi'); doBIQuery(); }
+}
+
+async function clearBIHistory() {
+  const sid = document.getElementById('biSessionId').value;
+  try {
+    await fetch(BASE+'/api/v1/bi/history/'+sid,{method:'DELETE',headers:{'X-User-Id':'web','X-User-Role':store.role}});
+    toast('会话历史已清除', 'success');
+  } catch(e) { toast('清除失败', 'error'); }
+}
+
+function copyText(btn, text) {
+  navigator.clipboard.writeText(text).then(()=>{
+    btn.textContent='已复制!'; setTimeout(()=>btn.textContent='复制',1500);
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Page 3: Document Center
+   ══════════════════════════════════════════════════════════════ */
+async function loadDocs(page=1) {
+  const kw = document.getElementById('docSearch').value;
+  try {
+    const resp = await fetch(BASE+`/api/v1/knowledge/docs?page=${page}&page_size=15&keyword=${encodeURIComponent(kw)}`,{
+      headers:{'X-User-Id':'web','X-User-Role':store.role}
+    });
+    const json = await resp.json();
+    const data = json.data;
+    renderDocTable(data.items||[], data.total||0, data.page||1, data.page_size||15);
+  } catch(e) {
+    document.getElementById('docTableWrap').innerHTML = '<div class="empty-state"><div class="empty-icon">⚠️</div>加载失败</div>';
+  }
+}
+
+function renderDocTable(items, total, page, pageSize) {
+  if (!items.length) {
+    document.getElementById('docTableWrap').innerHTML = '<div class="empty-state"><div class="empty-icon">📁</div>暂无文档</div>';
+    document.getElementById('docPagination').innerHTML = '';
+    return;
+  }
+  let html = `<table class="doc-table"><thead><tr>
+    <th>文档名称</th><th>类型</th><th>分类</th><th>车型</th><th>分块数</th><th>策略</th><th>状态</th><th>操作</th>
+  </tr></thead><tbody>`;
+  html += items.map(d=>`<tr>
+    <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(d.doc_name)}">${escHtml(d.doc_name)}</td>
+    <td>${escHtml(d.doc_type||'')}</td>
+    <td>${escHtml(d.category||'—')}</td>
+    <td>${escHtml(d.model_code||'—')}</td>
+    <td>${d.chunk_count||0}</td>
+    <td>${escHtml(d.chunk_strategy||'')}</td>
+    <td><span class="status-badge ${(d.status||'').toLowerCase()}">${escHtml(d.status||'')}</span></td>
+    <td><button class="del-btn" onclick="deleteDoc('${d.doc_id}')">删除</button></td>
+  </tr>`).join('');
+  html += '</tbody></table>';
+  document.getElementById('docTableWrap').innerHTML = html;
+
+  const totalPages = Math.ceil(total/pageSize);
+  let pagHtml = `<button ${page<=1?'disabled':''} onclick="loadDocs(${page-1})">上一页</button>`;
+  pagHtml += `<span class="page-num">第 ${page} / ${totalPages} 页 (共 ${total} 条)</span>`;
+  pagHtml += `<button ${page>=totalPages?'disabled':''} onclick="loadDocs(${page+1})">下一页</button>`;
+  document.getElementById('docPagination').innerHTML = pagHtml;
+}
+
+async function deleteDoc(docId) {
+  if (!confirm('确定删除此文档？将同时删除向量数据和元数据。')) return;
+  try {
+    await fetch(BASE+'/api/v1/ingest/docs/'+docId,{method:'DELETE',headers:{'X-User-Id':'web','X-User-Role':store.role}});
+    toast('文档已删除', 'success');
+    loadDocs();
+  } catch(e) { toast('删除失败', 'error'); }
+}
+
+/* ── Upload Modal ── */
+function openUploadModal() {
+  store._uploadFile = null;
+  document.getElementById('selectedFile').innerHTML = '';
+  document.getElementById('uploadProgress').innerHTML = '';
+  document.getElementById('uploadConfirmBtn').disabled = false;
+  document.getElementById('uploadModal').classList.add('show');
+}
+
+function closeUploadModal() {
+  document.getElementById('uploadModal').classList.remove('show');
+}
+
+function onFileSelected(file) {
+  if (!file) return;
+  store._uploadFile = file;
+  document.getElementById('selectedFile').innerHTML = `已选择：<strong>${escHtml(file.name)}</strong> (${(file.size/1024).toFixed(1)} KB)`;
+}
+
+// Drag & drop
+const dropZone = document.getElementById('dropZone');
+dropZone.addEventListener('dragover', e=>{ e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', ()=>{ dropZone.classList.remove('drag-over'); });
+dropZone.addEventListener('drop', e=>{
+  e.preventDefault(); dropZone.classList.remove('drag-over');
+  if (e.dataTransfer.files.length) onFileSelected(e.dataTransfer.files[0]);
+});
+
+async function doUpload() {
+  if (!store._uploadFile) { toast('请选择文件', 'error'); return; }
+  const btn = document.getElementById('uploadConfirmBtn');
+  btn.disabled = true;
+
+  const form = new FormData();
+  form.append('file', store._uploadFile);
+  form.append('doc_type', document.getElementById('uploadDocType').value);
+  form.append('category', document.getElementById('uploadCategory').value);
+  form.append('model_code', document.getElementById('uploadModel').value);
+  form.append('chunk_strategy', document.getElementById('uploadChunk').value);
+
+  try {
+    const resp = await fetch(BASE+'/api/v1/ingest/upload',{
+      method:'POST', headers:{'X-User-Id':'web','X-User-Role':store.role}, body: form
+    });
+    const json = await resp.json();
+    if (json.data) {
+      const docId = json.data.doc_id;
+      const docName = json.data.doc_name;
+      if (!recentUploads.includes(docName)) { recentUploads.unshift(docName); if (recentUploads.length>50) recentUploads.pop(); }
+      localStorage.setItem('rd_recent_uploads', JSON.stringify(recentUploads));
+      toast('上传成功，开始入库…', 'success');
+      pollProgress(docId);
+    }
+  } catch(e) { toast('上传失败: '+e.message, 'error'); btn.disabled = false; }
+}
+
+async function pollProgress(docId) {
+  const el = document.getElementById('uploadProgress');
+  for (let i=0; i<30; i++) {
+    await sleep(2000);
+    try {
+      const resp = await fetch(BASE+'/api/v1/ingest/jobs/'+docId);
+      const json = await resp.json();
+      const job = json.data;
+      el.innerHTML = `<div style="margin-top:8px;">阶段：${job.stage} — ${job.progress}%</div><div class="progress-bar"><div class="fill" style="width:${job.progress}%"></div></div>`;
+      if (job.progress >= 100 || job.stage === 'index') { el.innerHTML += '<div style="color:var(--success);margin-top:4px;">✅ 入库完成</div>'; break; }
+      if (job.error_msg) { el.innerHTML += `<div style="color:var(--danger);margin-top:4px;">❌ ${escHtml(job.error_msg)}</div>`; break; }
+    } catch(e) {}
+  }
+  document.getElementById('uploadConfirmBtn').disabled = false;
+  loadDocs();
+  renderHistory();
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Markdown Renderer
+   ══════════════════════════════════════════════════════════════ */
+function renderMarkdown(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/^### (.+)$/gm,'<h3>$1</h3>')
+    .replace(/^## (.+)$/gm,'<h2>$1</h2>')
+    .replace(/^# (.+)$/gm,'<h1>$1</h1>')
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/^\- (.+)$/gm,'<li>$1</li>')
+    .replace(/((?:\n<li>.+<\/li>)+)/g,'\n<ul>$1</ul>\n')
+    .replace(/\n{2,}/g,'\n\n')
+    .replace(/\n/g,'<br>')
+    .replace(/---/g,'<hr>');
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Helpers
+   ══════════════════════════════════════════════════════════════ */
+function escHtml(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function toggleTheme() {
+  const isDark = document.documentElement.getAttribute('data-theme')==='dark';
+  document.documentElement.setAttribute('data-theme', isDark?'':'dark');
+  store.theme = isDark?'light':'dark';
+  localStorage.setItem('rd_knowledge_theme', store.theme);
+}
+
+function onRoleChange() {
+  store.role = document.getElementById('roleSelect').value;
+  localStorage.setItem('rd_knowledge_role', store.role);
+}
+
+function toast(msg, type) {
+  const el = document.createElement('div');
+  el.className = 'toast '+type;
+  el.textContent = msg;
+  document.getElementById('toastContainer').appendChild(el);
+  setTimeout(()=>el.remove(), 2500);
+}
+
+function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+
+init();
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</body>
+</html>

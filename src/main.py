@@ -9,6 +9,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from src.core.base_schema import ResponseSchema
 from src.core.config import get_settings
@@ -57,3 +59,13 @@ app.include_router(ingest_router)
 @app.get("/health", response_model=ResponseSchema[dict])
 async def health():
     return ResponseSchema(data={"app": settings.APP_NAME, "env": settings.APP_ENV})
+
+
+# ── 静态文件 & SPA ───────────────────────────────────────────────────────
+
+app.mount("/static", StaticFiles(directory="src/static"), name="static")
+
+
+@app.get("/")
+async def index():
+    return FileResponse("src/static/index.html")
