@@ -1,0 +1,334 @@
+# ============================================================
+# NL2SQL 元数据定义 — ALM 平台业务库
+# 离线构建脚本读取此文件 → PG 元数据表 + Milvus 向量 + ES 列值
+# ============================================================
+
+tables:
+  - name: alm_issues
+    role: fact
+    description: 问题跟踪
+    columns:
+      - name: id
+        type: BIGINT
+        role: primary_key
+      - name: issue_no
+        type: VARCHAR(50)
+        role: dimension
+        description: 问题单号
+      - name: title
+        type: VARCHAR(500)
+        role: dimension
+        description: 问题标题
+      - name: description
+        type: TEXT
+        role: dimension
+        description: 问题描述
+      - name: source
+        type: VARCHAR(20)
+        role: dimension
+        description: 问题来源
+        alias: ["来源", "渠道"]
+        sync: true
+      - name: business_line
+        type: VARCHAR(10)
+        role: dimension
+        description: 业务线
+        alias: ["业务", "产品线"]
+        sync: true
+      - name: status
+        type: VARCHAR(20)
+        role: dimension
+        description: 问题状态
+        alias: ["状态"]
+        sync: true
+      - name: severity
+        type: VARCHAR(20)
+        role: dimension
+        description: 严重级别
+        alias: ["严重程度", "优先级"]
+        sync: true
+      - name: model_code
+        type: VARCHAR(50)
+        role: dimension
+        description: 车型代码
+        alias: ["车型"]
+      - name: sw_version
+        type: VARCHAR(50)
+        role: dimension
+        description: 软件版本
+        alias: ["版本"]
+      - name: dtc_snapshot
+        type: VARCHAR(500)
+        role: dimension
+        description: DTC快照
+      - name: owner_domain_id
+        type: BIGINT
+        role: foreign_key
+        description: 关联责任域ID
+      - name: external_ref
+        type: VARCHAR(100)
+        role: dimension
+        description: 外部引用
+      - name: created_at
+        type: TIMESTAMP
+        role: date
+        description: 创建时间
+        alias: ["创建日期", "时间", "日期", "提单时间"]
+      - name: updated_at
+        type: TIMESTAMP
+        role: date
+        description: 更新时间
+        alias: ["修改时间"]
+
+  - name: alm_change_requests
+    role: fact
+    description: 变更记录
+    columns:
+      - name: id
+        type: BIGINT
+        role: primary_key
+      - name: cr_no
+        type: VARCHAR(50)
+        role: dimension
+        description: 变更编号
+      - name: title
+        type: VARCHAR(500)
+        role: dimension
+        description: 变更标题
+      - name: reason
+        type: TEXT
+        role: dimension
+        description: 变更原因
+      - name: scope_desc
+        type: TEXT
+        role: dimension
+        description: 影响范围
+      - name: business_line
+        type: VARCHAR(10)
+        role: dimension
+        description: 业务线
+        alias: ["业务", "产品线"]
+        sync: true
+      - name: status
+        type: VARCHAR(20)
+        role: dimension
+        description: 变更状态
+        alias: ["状态"]
+        sync: true
+      - name: target_baseline_id
+        type: BIGINT
+        role: foreign_key
+        description: 关联基线ID
+      - name: source_issue_id
+        type: BIGINT
+        role: foreign_key
+        description: 来源问题ID
+      - name: created_at
+        type: TIMESTAMP
+        role: date
+        description: 创建时间
+        alias: ["创建日期", "时间", "日期"]
+      - name: updated_at
+        type: TIMESTAMP
+        role: date
+        description: 更新时间
+
+  - name: owner_domains
+    role: dim
+    description: 责任域
+    columns:
+      - name: id
+        type: BIGINT
+        role: primary_key
+      - name: name
+        type: VARCHAR(100)
+        role: dimension
+        description: 责任域名称
+        alias: ["域", "责任方", "模块"]
+        sync: true
+      - name: business_line
+        type: VARCHAR(10)
+        role: dimension
+        description: 业务线
+      - name: description
+        type: TEXT
+        role: dimension
+        description: 描述
+      - name: owner_name
+        type: VARCHAR(100)
+        role: dimension
+        description: 负责人
+
+  - name: alm_baselines
+    role: dim
+    description: 基线
+    columns:
+      - name: id
+        type: BIGINT
+        role: primary_key
+      - name: baseline_no
+        type: VARCHAR(50)
+        role: dimension
+        description: 基线编号
+      - name: name
+        type: VARCHAR(200)
+        role: dimension
+        description: 基线名称
+        alias: ["基线名"]
+      - name: business_line
+        type: VARCHAR(10)
+        role: dimension
+        description: 业务线
+      - name: is_frozen
+        type: BOOLEAN
+        role: dimension
+        description: 是否已冻结
+        alias: ["冻结状态"]
+      - name: freeze_date
+        type: VARCHAR(20)
+        role: date
+        description: 冻结日期
+      - name: release_date
+        type: VARCHAR(20)
+        role: date
+        description: 发布日期
+      - name: created_at
+        type: TIMESTAMP
+        role: date
+        description: 创建时间
+      - name: updated_at
+        type: TIMESTAMP
+        role: date
+        description: 更新时间
+
+  - name: alm_requirements
+    role: fact
+    description: 需求
+    columns:
+      - name: id
+        type: BIGINT
+        role: primary_key
+      - name: req_no
+        type: VARCHAR(50)
+        role: dimension
+        description: 需求编号
+      - name: title
+        type: VARCHAR(500)
+        role: dimension
+        description: 需求标题
+      - name: description
+        type: TEXT
+        role: dimension
+        description: 需求描述
+      - name: business_line
+        type: VARCHAR(10)
+        role: dimension
+        description: 业务线
+      - name: priority
+        type: VARCHAR(20)
+        role: dimension
+        description: 优先级
+        alias: ["重要程度"]
+        sync: true
+      - name: status
+        type: VARCHAR(20)
+        role: dimension
+        description: 需求状态
+        alias: ["状态"]
+        sync: true
+      - name: baseline_id
+        type: BIGINT
+        role: foreign_key
+        description: 关联基线ID
+      - name: created_at
+        type: TIMESTAMP
+        role: date
+        description: 创建时间
+        alias: ["创建日期", "时间"]
+      - name: updated_at
+        type: TIMESTAMP
+        role: date
+        description: 更新时间
+
+  - name: alm_config_items
+    role: dim
+    description: 配置项
+    columns:
+      - name: id
+        type: BIGINT
+        role: primary_key
+      - name: ci_no
+        type: VARCHAR(50)
+        role: dimension
+        description: 配置项编号
+      - name: name
+        type: VARCHAR(200)
+        role: dimension
+        description: 配置项名称
+        alias: ["CI名称", "配置名称"]
+      - name: alias
+        type: VARCHAR(500)
+        role: dimension
+        description: 别名
+      - name: category
+        type: VARCHAR(30)
+        role: dimension
+        description: 分类
+        alias: ["类别"]
+        sync: true
+      - name: module
+        type: VARCHAR(100)
+        role: dimension
+        description: 模块
+      - name: supplier
+        type: VARCHAR(200)
+        role: dimension
+        description: 供应商
+        alias: ["厂家"]
+      - name: part_number
+        type: VARCHAR(100)
+        role: dimension
+        description: 零件号
+      - name: sw_version
+        type: VARCHAR(50)
+        role: dimension
+        description: 软件版本
+      - name: is_safety_related
+        type: BOOLEAN
+        role: dimension
+        description: 是否安全相关
+        alias: ["安全件"]
+      - name: lifecycle_status
+        type: VARCHAR(20)
+        role: dimension
+        description: 生命周期状态
+        alias: ["生命周期", "阶段"]
+        sync: true
+      - name: business_line
+        type: VARCHAR(10)
+        role: dimension
+        description: 业务线
+      - name: created_at
+        type: TIMESTAMP
+        role: date
+        description: 创建时间
+      - name: updated_at
+        type: TIMESTAMP
+        role: date
+        description: 更新时间
+
+metrics:
+  - name: issue_count
+    description: 问题数量统计，使用 COUNT(*) 聚合
+    relevant_columns: ["alm_issues.id"]
+    alias: ["问题数", "工单数", "缺陷数", "问题总数", "数量"]
+
+  - name: cr_count
+    description: 变更请求数量统计，使用 COUNT(*) 聚合
+    relevant_columns: ["alm_change_requests.id"]
+    alias: ["变更数", "CR数量", "变更请求数", "数量"]
+
+  - name: requirement_count
+    description: 需求数量统计，使用 COUNT(*) 聚合
+    relevant_columns: ["alm_requirements.id"]
+    alias: ["需求数", "需求总量", "数量"]

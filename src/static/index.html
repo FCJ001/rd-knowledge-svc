@@ -212,6 +212,28 @@ body {
 
 .chart-container { width:100%; height:360px; background:var(--card); border:1px solid var(--border); border-radius:var(--radius); }
 
+/* ── Pipeline Progress ── */
+.pipeline-progress {
+  display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; padding:14px;
+  background:var(--bg); border-radius:var(--radius-sm); border:1px solid var(--border);
+}
+.progress-step {
+  font-size:12px; padding:4px 10px; border-radius:12px;
+  border:1px solid var(--border); white-space:nowrap;
+  transition: all .3s ease;
+}
+.progress-pending { color:var(--muted); background:var(--card); }
+.progress-running {
+  color:var(--primary); background:var(--primary-light); border-color:var(--primary);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.progress-success { color:var(--success); background:var(--success-light); border-color:var(--success); }
+.progress-error { color:var(--danger); background:var(--danger-light); border-color:var(--danger); }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
 /* ══════════════════════════════════════════════════════════════
    Docs Page
    ══════════════════════════════════════════════════════════════ */
@@ -621,6 +643,34 @@ async function submitFeedback(rating) {
 /* ══════════════════════════════════════════════════════════════
    Page 2: BI Query
    ══════════════════════════════════════════════════════════════ */
+// 进度步骤定义（按流水线顺序）
+const STEPS = [
+  {key:'抽取关键字', icon:'🔍'},
+  {key:'召回字段', icon:'📊'},
+  {key:'召回字段取值', icon:'🔎'},
+  {key:'召回指标', icon:'📈'},
+  {key:'合并召回信息', icon:'🔗'},
+  {key:'过滤表格', icon:'📋'},
+  {key:'过滤指标', icon:'🎯'},
+  {key:'添加额外上下文信息', icon:'📅'},
+  {key:'生成SQL', icon:'💾'},
+  {key:'验证SQL', icon:'✅'},
+  {key:'校正SQL', icon:'🔧'},
+  {key:'执行SQL', icon:'🚀'},
+];
+
+function buildProgressHTML(progressMap) {
+  return STEPS.map(s => {
+    const st = progressMap[s.key];
+    let cls = 'progress-pending';
+    let icon = s.icon;
+    if (st === 'running') { cls = 'progress-running'; icon = '⏳'; }
+    else if (st === 'success') { cls = 'progress-success'; icon = '✅'; }
+    else if (st === 'error') { cls = 'progress-error'; icon = '❌'; }
+    return `<span class="progress-step ${cls}">${icon} ${s.key}</span>`;
+  }).join('');
+}
+
 async function doBIQuery() {
   const input = document.getElementById('biInput');
   const q = input.value.trim();
@@ -628,26 +678,159 @@ async function doBIQuery() {
 
   const btn = document.getElementById('biSendBtn');
   btn.disabled = true;
-  document.getElementById('biResults').innerHTML = '<div class="loading"><div class="spinner"></div><div style="margin-top:12px;">查询中…</div></div>';
 
+  const progressMap = {};
+  const progressStepsHTML = STEPS.map(s =>
+    `<span class="progress-step progress-pending">${s.icon} ${s.key}</span>`
+  ).join('');
+
+  document.getElementById('biResults').innerHTML = `
+    <div class="result-card">
+      <div class="rc-header"><span style="font-weight:600;color:var(--title);">${escHtml(q)}</span></div>
+      <div id="pipelineProgress" class="pipeline-progress">${progressStepsHTML}</div>
+      <div id="biResultContent" style="margin-top:16px;"></div>
+    </div>`;
+
+  // 尝试 SSE 流式查询，失败则降级到旧接口
   try {
-    const resp = await fetch(BASE+'/api/v1/bi/query',{
+    const resp = await fetch(BASE+'/api/v1/bi/query-stream',{
       method:'POST',
       headers:{'Content-Type':'application/json','X-User-Id':'web','X-User-Role':store.role},
       body: JSON.stringify({question:q, session_id:store.biSession, with_chart:true})
     });
-    const json = await resp.json();
-    const data = json.data;
 
-    if (!biHistory.includes(q)) { biHistory.unshift(q); if (biHistory.length>50) biHistory.pop(); }
-    localStorage.setItem('rd_bi_history', JSON.stringify(biHistory));
+    if (resp.ok && resp.headers.get('content-type')?.includes('text/event-stream')) {
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let finalData = null;
 
-    renderBIResult(data);
-    renderHistory();
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {stream: true});
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const payload = JSON.parse(line.slice(6));
+
+            // 进度事件：更新步骤状态
+            if (payload.type === 'progress') {
+              progressMap[payload.step] = payload.status;
+              const el = document.getElementById('pipelineProgress');
+              if (el) el.innerHTML = buildProgressHTML(progressMap);
+              continue;
+            }
+
+            // 结果事件（来自 execute_sql writer）
+            if (payload.type === 'result') {
+              finalData = {
+                success: true,
+                sql: payload.data.sql,
+                data: payload.data.data || [],
+                columns: payload.data.columns || [],
+                row_count: payload.data.row_count || 0,
+                summary: payload.data.summary || '',
+                error: '',
+              };
+              continue;
+            }
+
+            // 节点完成事件
+            if (payload.node === 'execute_sql' && payload.data) {
+              if (!finalData) {
+                finalData = {
+                  success: !payload.data.result_error,
+                  sql: payload.data.result_sql,
+                  data: payload.data.result_data || [],
+                  columns: payload.data.result_columns || [],
+                  row_count: payload.data.result_row_count || 0,
+                  summary: payload.data.result_summary || '',
+                  chart: payload.chart || null,
+                  error: payload.data.result_error || '',
+                };
+              } else if (payload.chart) {
+                finalData.chart = payload.chart;
+              }
+            }
+          } catch(ignored) {}
+        }
+      }
+
+      if (finalData) {
+        if (!biHistory.includes(q)) { biHistory.unshift(q); if (biHistory.length>50) biHistory.pop(); }
+        localStorage.setItem('rd_bi_history', JSON.stringify(biHistory));
+        renderBIResultInline(finalData);
+        renderHistory();
+        btn.disabled = false;
+        return;
+      }
+    }
+    throw new Error('SSE 未返回有效结果');
   } catch(e) {
-    document.getElementById('biResults').innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div>请求失败：${escHtml(e.message)}</div>`;
+    // 降级到旧接口
+    try {
+      const resp = await fetch(BASE+'/api/v1/bi/query',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','X-User-Id':'web','X-User-Role':store.role},
+        body: JSON.stringify({question:q, session_id:store.biSession, with_chart:true})
+      });
+      const json = await resp.json();
+      const data = json.data;
+
+      if (!biHistory.includes(q)) { biHistory.unshift(q); if (biHistory.length>50) biHistory.pop(); }
+      localStorage.setItem('rd_bi_history', JSON.stringify(biHistory));
+
+      renderBIResult(data);
+      renderHistory();
+    } catch(e2) {
+      document.getElementById('biResults').innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div>请求失败：${escHtml(e2.message)}</div>`;
+    }
   }
   btn.disabled = false;
+}
+
+// 在 SSE 流内部渲染结果（不刷新整个卡片）
+function renderBIResultInline(data) {
+  const el = document.getElementById('biResultContent');
+  if (!data || (!data.success && !data.summary)) {
+    el.innerHTML = `<div class="empty-state" style="padding:20px"><div class="empty-icon">⚠️</div>${escHtml(data?.error||'查询失败')}</div>`;
+    return;
+  }
+
+  let html = '';
+  if (data.summary) {
+    html += `<div class="bi-section"><div class="bi-label">📋 摘要</div><div class="summary-text">${renderMarkdown(data.summary)}</div></div>`;
+  }
+  if (data.sql) {
+    html += `<div class="bi-section"><div class="bi-label">💾 SQL</div><pre style="position:relative"><button class="copy-btn" onclick="copyText(this,'${escHtml(data.sql).replace(/'/g,"\\'")}')">复制</button>${escHtml(data.sql)}</pre></div>`;
+  }
+  if (data.data && data.data.length) {
+    const cols = data.columns || Object.keys(data.data[0]);
+    html += `<div class="bi-section"><div class="bi-label">📊 数据 (${data.row_count} 行)</div><div style="overflow-x:auto"><table class="bi-table"><thead><tr>${cols.map(c=>`<th>${escHtml(c)}</th>`).join('')}</tr></thead><tbody>`;
+    html += data.data.map(row=>`<tr>${cols.map(c=>`<td>${escHtml(String(row[c]??''))}</td>`).join('')}</tr>`).join('');
+    html += '</tbody></table></div></div>';
+  }
+  if (data.chart) {
+    html += `<div class="bi-section"><div class="bi-label">📈 图表</div><div class="chart-container" id="biChart"></div></div>`;
+  }
+
+  el.innerHTML = html;
+
+  if (data.chart) {
+    setTimeout(()=>{
+      const chartEl = document.getElementById('biChart');
+      if (chartEl && typeof echarts !== 'undefined') {
+        const chart = echarts.init(chartEl);
+        chart.setOption(data.chart);
+        window.addEventListener('resize', ()=>chart.resize());
+      }
+    }, 100);
+  }
 }
 
 function renderBIResult(data) {
