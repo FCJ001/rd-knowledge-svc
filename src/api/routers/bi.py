@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import get_llm, get_embedding_model
 from src.core.base_schema import ResponseSchema
 from src.core.deps import UserContext, get_current_user
-from src.core.logger import logger
+from src.core.logger import logger, trace_id_var
 from src.infra.db import AsyncSessionLocal
 from src.infra.db_readonly import get_db_readonly
 from src.infra.es_client import get_es_client
@@ -31,6 +31,9 @@ from src.nl2sql.repositories import (
     MilvusMetricRepository,
     ESValueRepository,
 )
+from src.rag.evaluation.async_tracker import get_async_evaluator
+from src.rag.evaluation.guardrails import check_sql, check_output
+from src.rag.evaluation.token_tracker import TokenTracker
 
 router = APIRouter(prefix="/api/v1/bi", tags=["ChatBI"])
 
@@ -140,16 +143,17 @@ def _make_json_safe(obj):
         return obj
 
 
-async def _build_pipeline_context(alm_db: AsyncSession) -> dict:
+async def _build_pipeline_context(alm_db: AsyncSession) -> tuple[dict, AsyncSession, TokenTracker]:
     """构建 DataAgentContext，供流水线节点使用"""
     milvus = get_milvus_client()
     es = await get_es_client()
-
-    # PG 元数据需要 rd_knowledge 库的独立 session
     knowledge_db = AsyncSessionLocal()
 
+    tracker = TokenTracker()
+    llm = get_llm().with_config({"callbacks": [tracker]})
+
     ctx = {
-        "llm": get_llm(),
+        "llm": llm,
         "embedding_model": get_embedding_model(),
         "milvus_client": milvus,
         "milvus_column_repo": MilvusColumnRepository(milvus),
@@ -159,7 +163,7 @@ async def _build_pipeline_context(alm_db: AsyncSession) -> dict:
         "pg_meta_repo": PgMetaRepository(knowledge_db),
         "dw_db_session": alm_db,
     }
-    return ctx, knowledge_db
+    return ctx, knowledge_db, tracker
 
 
 @router.post("/query-stream")
@@ -171,7 +175,10 @@ async def bi_query_stream(
 ):
     """自然语言数据查询 — SSE 流式返回各节点执行状态 + 最终结果"""
     import asyncio as _asyncio
-    ctx, knowledge_db = await _build_pipeline_context(alm_db)
+    ctx, knowledge_db, token_tracker = await _build_pipeline_context(alm_db)
+
+    # 获取全链路 trace_id（由 logging middleware 注入）
+    bi_trace_id = trace_id_var.get()
 
     from src.nl2sql.pipeline import run_pipeline
 
@@ -195,6 +202,9 @@ async def bi_query_stream(
 
         task = _asyncio.ensure_future(run_to_queue())
 
+        # 保存 execute_sql 节点的结果，用于最终评估
+        last_result: dict = {}
+
         try:
             node_count = 0
             while True:
@@ -202,7 +212,7 @@ async def bi_query_stream(
                 if event is None:
                     break
                 if "__error__" in event:
-                    yield f"data: {json.dumps({'node': 'error', 'step': node_count, 'data': {'error': event['__error__']}}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'node': 'error', 'step': node_count, 'trace_id': bi_trace_id, 'data': {'error': event['__error__']}}, ensure_ascii=False)}\n\n"
                     break
                 if "__progress__" in event:
                     yield f"data: {json.dumps(event['__progress__'], ensure_ascii=False)}\n\n"
@@ -213,9 +223,19 @@ async def bi_query_stream(
                 node_data = event.get(node_name, {})
                 safe_data = _make_json_safe(node_data)
 
+                if node_name == "execute_sql" and isinstance(node_data, dict):
+                    last_result = node_data
+                    # Guardrails — SQL 安全检查
+                    sql_text = node_data.get("result_sql", "")
+                    safe, reason = check_sql(sql_text)
+                    if not safe:
+                        logger.warning(f"[Guardrails] {reason} | SQL: {sql_text[:200]}")
+                        payload["guard"] = {"passed": False, "reason": reason}
+
                 payload = {
                     "node": node_name,
                     "step": node_count,
+                    "trace_id": bi_trace_id,
                     "data": safe_data if safe_data else {},
                 }
 
@@ -234,6 +254,34 @@ async def bi_query_stream(
                         logger.warning(f"图表生成失败: {e}")
 
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            # ── Guardrails 输出检查 ──
+            if last_result:
+                summary = last_result.get("result_summary", "")
+                safe, reason = check_output(summary)
+                if not safe:
+                    logger.warning(f"[Guardrails] 输出检查: {reason}")
+
+            # ── 异步评估：不阻塞用户，后台调 LLM 打分 ──
+            if last_result:
+                evaluator = get_async_evaluator()
+                evaluator.evaluate(
+                    question=req.question,
+                    sql=last_result.get("result_sql", ""),
+                    data=last_result.get("result_data", []),
+                    summary=last_result.get("result_summary", ""),
+                    error=last_result.get("error") or last_result.get("result_error"),
+                    token_usage=token_tracker.usage,
+                )
+
+            # ── Token 用量 + 费用 ──
+            usage = token_tracker.usage
+            logger.info(
+                f"[Token] input={usage['input_tokens']} output={usage['output_tokens']} "
+                f"total={usage['total_tokens']} calls={usage['calls']} "
+                f"cost=${usage['cost_usd']:.6f}"
+            )
+
         finally:
             await task  # ensure pipeline completes
             await knowledge_db.close()

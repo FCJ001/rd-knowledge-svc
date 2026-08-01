@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RD Knowledge — 评测仪表盘</title>
+<style>
+/* ══════════════════════════════════════════════════════════════
+   Design Tokens
+   ══════════════════════════════════════════════════════════════ */
+:root {
+  --primary: #1E6FFF; --primary-hover: #1556CC; --primary-light: #EBF3FF;
+  --danger: #E32219; --danger-light: #FEF2F2;
+  --warning: #F59E0B; --warning-light: #FFFBEB;
+  --success: #10B981; --success-light: #ECFDF5;
+  --title: #111827; --body: #374151; --muted: #6B7280;
+  --border: #E5E7EB; --bg: #F9FAFB; --card: #FFFFFF;
+  --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+  --radius: 10px; --radius-sm: 6px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans SC", sans-serif;
+  --mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+}
+
+*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+
+body {
+  font-family: var(--font); font-size: 14px; color: var(--body);
+  background: var(--bg); -webkit-font-smoothing: antialiased;
+  padding: 40px; max-width: 1280px; margin: 0 auto;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Header
+   ══════════════════════════════════════════════════════════════ */
+.header {
+  display:flex; align-items:center; justify-content:space-between; margin-bottom:32px;
+}
+.header h1 { font-size:24px; color:var(--title); }
+.header .meta { display:flex; gap:16px; align-items:center; }
+.header .badge {
+  font-size:12px; padding:4px 10px; border-radius:99px; font-weight:500;
+  background:var(--primary-light); color:var(--primary);
+}
+.header .refresh-btn {
+  border:1px solid var(--border); background:var(--card); color:var(--body);
+  padding:6px 14px; border-radius:var(--radius-sm); cursor:pointer; font-size:13px;
+}
+.header .refresh-btn:hover { background:var(--bg); }
+
+/* ══════════════════════════════════════════════════════════════
+   Tabs
+   ══════════════════════════════════════════════════════════════ */
+.tabs { display:flex; gap:2px; margin-bottom:24px; border-bottom:2px solid var(--border); }
+.tab {
+  padding:10px 20px; cursor:pointer; font-size:14px; font-weight:500; color:var(--muted);
+  border-bottom:2px solid transparent; margin-bottom:-2px; transition:all .15s;
+}
+.tab:hover { color:var(--body); }
+.tab.active { color:var(--primary); border-bottom-color:var(--primary); }
+
+/* ══════════════════════════════════════════════════════════════
+   Stats Grid
+   ══════════════════════════════════════════════════════════════ */
+.stat-grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:16px; margin-bottom:24px; }
+.stat-card {
+  background:var(--card); border-radius:var(--radius); padding:20px;
+  box-shadow:var(--shadow); border:1px solid var(--border);
+}
+.stat-card .label { font-size:12px; color:var(--muted); margin-bottom:6px; }
+.stat-card .value { font-size:28px; font-weight:700; color:var(--title); }
+.stat-card .sub { font-size:12px; color:var(--muted); margin-top:4px; }
+
+/* ══════════════════════════════════════════════════════════════
+   Table
+   ══════════════════════════════════════════════════════════════ */
+.card {
+  background:var(--card); border-radius:var(--radius); box-shadow:var(--shadow);
+  border:1px solid var(--border); margin-bottom:24px; overflow:hidden;
+}
+.card-header { padding:16px 20px; border-bottom:1px solid var(--border); font-weight:600; color:var(--title); display:flex; justify-content:space-between; align-items:center; }
+.card-body { overflow-x:auto; }
+
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; padding:10px 16px; background:var(--bg); color:var(--muted); font-weight:600; font-size:12px; border-bottom:1px solid var(--border); white-space:nowrap; }
+td { padding:10px 16px; border-bottom:1px solid var(--border); color:var(--body); }
+tr:last-child td { border-bottom:none; }
+tr:hover td { background:var(--bg); }
+
+/* ══════════════════════════════════════════════════════════════
+   Score Badge
+   ══════════════════════════════════════════════════════════════ */
+.score { display:inline-block; padding:2px 8px; border-radius:99px; font-weight:600; font-size:12px; }
+.score.high { background:var(--success-light); color:var(--success); }
+.score.mid { background:var(--warning-light); color:var(--warning); }
+.score.low { background:var(--danger-light); color:var(--danger); }
+
+/* ══════════════════════════════════════════════════════════════
+   Feedback Stats
+   ══════════════════════════════════════════════════════════════ */
+.fb-bar {
+  display:flex; align-items:center; gap:12px; padding:8px 0;
+}
+.fb-bar .bar-track { flex:1; height:8px; background:var(--border); border-radius:4px; overflow:hidden; display:flex; }
+.fb-bar .bar-good { background:var(--success); }
+.fb-bar .bar-bad { background:var(--danger); }
+.fb-bar .bar-neutral { background:var(--muted); }
+
+.empty { text-align:center; padding:40px; color:var(--muted); }
+.loading { text-align:center; padding:40px; color:var(--muted); }
+.error { text-align:center; padding:40px; color:var(--danger); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>评测仪表盘</h1>
+  </div>
+  <div class="meta">
+    <span class="badge" id="badge-env">dev</span>
+    <button class="refresh-btn" onclick="refreshAll()">刷新</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('online')">在线评测</div>
+  <div class="tab" onclick="switchTab('offline')">离线评测</div>
+  <div class="tab" onclick="switchTab('feedback')">用户反馈</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     Tab: 在线评测
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-online" class="tab-content">
+
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="label">总评测次数</div>
+      <div class="value" id="online-total">-</div>
+      <div class="sub" id="online-breakdown"></div>
+    </div>
+    <div class="stat-card">
+      <div class="label">NL2SQL · SQL可执行率</div>
+      <div class="value" id="online-sql-valid">-</div>
+      <div class="sub" id="online-nl2sql-total"></div>
+    </div>
+    <div class="stat-card">
+      <div class="label">NL2SQL · 数据返回率</div>
+      <div class="value" id="online-nl2sql-hasdata">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">NL2SQL · 相关度</div>
+      <div class="value" id="online-nl2sql-relevance">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">知识检索 · 答案相关性</div>
+      <div class="value" id="online-k-answer-rel">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">知识检索 · 上下文相关性</div>
+      <div class="value" id="online-k-context-rel">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">知识检索 · 有据性</div>
+      <div class="value" id="online-k-groundedness">-</div>
+      <div class="sub" id="online-knowledge-total"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">在线评测记录</div>
+    <div class="card-body">
+      <div id="online-content" class="loading">加载中...</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     Tab: 离线评测
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-offline" class="tab-content" style="display:none">
+
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="label">离线记录总数</div>
+      <div class="value" id="offline-total">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">评测应用数</div>
+      <div class="value" id="offline-apps">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">TruLens Dashboard</div>
+      <div class="value" style="font-size:18px;"><a href="http://localhost:8501" target="_blank" style="color:var(--primary);text-decoration:none;">打开 →</a></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">Leaderboard（TruLens 指标汇总）</div>
+    <div class="card-body">
+      <div id="offline-leaderboard" class="loading">加载中...</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:24px;">
+    <div class="card-header">离线评测记录</div>
+    <div class="card-body">
+      <div id="offline-records" class="loading">加载中...</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     Tab: 用户反馈
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-feedback" class="tab-content" style="display:none">
+
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="label">总反馈数（30天）</div>
+      <div class="value" id="fb-total">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">好评率</div>
+      <div class="value" id="fb-praise-rate">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">差评率</div>
+      <div class="value" id="fb-negative-rate">-</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">好评率趋势（30天）<div>
+      <div class="fb-bar" id="fb-bar">
+        <span style="font-size:13px;">暂无数据</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/api/v1/eval';
+const FB_API = '/api/v1/feedback';
+
+// ═══════════════════════════════════════════════════════════
+// Tab switching
+// ═══════════════════════════════════════════════════════════
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+  const idx = name === 'online' ? 0 : name === 'offline' ? 1 : 2;
+  document.querySelectorAll('.tab')[idx].classList.add('active');
+  document.getElementById(`tab-${name}`).style.display = 'block';
+  if (name === 'online') loadOnline();
+  else if (name === 'offline') loadOffline();
+  else loadFeedback();
+}
+
+function refreshAll() {
+  const active = document.querySelector('.tab.active');
+  const idx = [...document.querySelectorAll('.tab')].indexOf(active);
+  switchTab(['online', 'offline', 'feedback'][idx]);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Score helpers
+// ═══════════════════════════════════════════════════════════
+function scoreClass(v) {
+  if (v == null) return 'mid';
+  if (v >= 0.8) return 'high';
+  if (v >= 0.5) return 'mid';
+  return 'low';
+}
+
+function fmtScore(v) {
+  if (v == null) return '-';
+  return typeof v === 'number' ? v.toFixed(2) : v;
+}
+
+function fmtSQL(sql) {
+  if (!sql) return '';
+  return sql.length > 100 ? sql.substring(0, 100) + '...' : sql;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Online Scores
+// ═══════════════════════════════════════════════════════════
+async function loadOnline() {
+  const box = document.getElementById('online-content');
+  box.innerHTML = '<div class="loading">加载中...</div>';
+
+  try {
+    const [scoresRes, summaryRes] = await Promise.all([
+      fetch(`${API}/scores?eval_type=online&limit=50`),
+      fetch(`${API}/scores/summary`),
+    ]);
+    const scores = await scoresRes.json();
+    const summary = await summaryRes.json();
+
+    // Stats
+    const onlineData = summary.data?.online || {};
+    const nl2sql = onlineData.nl2sql || {};
+    const knowledge = onlineData.knowledge || {};
+    document.getElementById('online-total').textContent = onlineData.total ?? '-';
+    document.getElementById('online-breakdown').textContent = `NL2SQL: ${nl2sql.total ?? 0} | 知识检索: ${knowledge.total ?? 0}`;
+    document.getElementById('online-sql-valid').textContent = nl2sql.avg_sql_valid != null ? (nl2sql.avg_sql_valid * 100).toFixed(0) + '%' : '-';
+    document.getElementById('online-nl2sql-total').textContent = `共 ${nl2sql.total ?? 0} 次`;
+    document.getElementById('online-nl2sql-hasdata').textContent = nl2sql.avg_has_data != null ? (nl2sql.avg_has_data * 100).toFixed(0) + '%' : '-';
+    document.getElementById('online-nl2sql-relevance').textContent = nl2sql.avg_relevance != null ? nl2sql.avg_relevance.toFixed(2) : '-';
+    document.getElementById('online-k-answer-rel').textContent = knowledge.avg_answer_relevance != null ? knowledge.avg_answer_relevance.toFixed(2) : '-';
+    document.getElementById('online-k-context-rel').textContent = knowledge.avg_context_relevance != null ? knowledge.avg_context_relevance.toFixed(2) : '-';
+    document.getElementById('online-k-groundedness').textContent = knowledge.avg_groundedness != null ? knowledge.avg_groundedness.toFixed(2) : '-';
+    document.getElementById('online-knowledge-total').textContent = `共 ${knowledge.total ?? 0} 次`;
+
+    // Table
+    const items = scores.data?.items || [];
+    if (items.length === 0) {
+      box.innerHTML = '<div class="empty">暂无在线评测数据</div>';
+      return;
+    }
+
+    box.innerHTML = `<table>
+      <thead><tr>
+        <th>类型</th><th>问题</th><th>SQL可执行</th><th>数据返回</th><th>相关性</th><th>上下文</th><th>有据性</th><th>Token</th><th>费用</th><th>时间</th>
+      </tr></thead>
+      <tbody>${items.map(r => {
+        const isKnowledge = (r.eval_type || '').includes('knowledge');
+        return `
+        <tr>
+          <td><span class="score ${isKnowledge ? 'mid' : 'high'}">${isKnowledge ? '知识' : 'NL2SQL'}</span></td>
+          <td title="${esc(r.question)}">${esc(r.question).substring(0, 45)}</td>
+          <td>${isKnowledge ? '-' : `<span class="score ${scoreClass(r.score_sql_valid)}">${fmtScore(r.score_sql_valid)}</span>`}</td>
+          <td>${isKnowledge ? '-' : `<span class="score ${scoreClass(r.score_has_data)}">${fmtScore(r.score_has_data)}</span>`}</td>
+          <td><span class="score ${scoreClass(r.score_relevance)}">${fmtScore(r.score_relevance)}</span></td>
+          <td>${isKnowledge ? `<span class="score ${scoreClass(r.score_context_relevance)}">${fmtScore(r.score_context_relevance)}</span>` : '-'}</td>
+          <td>${isKnowledge ? `<span class="score ${scoreClass(r.score_groundedness)}">${fmtScore(r.score_groundedness)}</span>` : '-'}</td>
+          <td style="font-size:12px;">${r.token_input||0}+${r.token_output||0}</td>
+          <td style="font-size:12px;">$${(r.token_cost_usd||0).toFixed(4)}</td>
+          <td style="font-size:12px;">${r.created_at ? new Date(r.created_at).toLocaleString('zh-CN') : '-'}</td>
+        </tr>`}).join('')}
+      </tbody></table>`;
+  } catch (e) {
+    box.innerHTML = `<div class="error">加载失败: ${esc(e.message)}</div>`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Offline Scores
+// ═══════════════════════════════════════════════════════════
+async function loadOffline() {
+  const lb = document.getElementById('offline-leaderboard');
+  const recs = document.getElementById('offline-records');
+  lb.innerHTML = '<div class="loading">加载中...</div>';
+  recs.innerHTML = '<div class="loading">加载中...</div>';
+
+  try {
+    const [scoresRes, summaryRes] = await Promise.all([
+      fetch(`${API}/scores?eval_type=offline&limit=50`),
+      fetch(`${API}/scores/summary`),
+    ]);
+    const scores = await scoresRes.json();
+    const summary = await summaryRes.json();
+
+    const offlineData = summary.data?.offline || {};
+
+    // Stats
+    document.getElementById('offline-total').textContent = offlineData.total_records ?? '-';
+    const leaderboard = summary.data?.leaderboard || [];
+    document.getElementById('offline-apps').textContent = leaderboard.length || '-';
+
+    // Leaderboard
+    if (leaderboard.length === 0) {
+      lb.innerHTML = '<div class="empty">暂无 Leaderboard 数据（运行离线评测后生成）</div>';
+    } else {
+      const cols = Object.keys(leaderboard[0]);
+      lb.innerHTML = `<table>
+        <thead><tr>${cols.map(c => `<th>${c}</th>`).join('')}</tr></thead>
+        <tbody>${leaderboard.map(row => `
+          <tr>${cols.map(c => `<td>${fmtScore(row[c])}</td>`).join('')}</tr>
+        `).join('')}</tbody></table>`;
+    }
+
+    // Records
+    const items = scores.data?.items || [];
+    if (items.length === 0) {
+      recs.innerHTML = '<div class="empty">暂无离线评测记录</div>';
+      return;
+    }
+
+    recs.innerHTML = `<table>
+      <thead><tr>
+        <th>Record ID</th><th>输入</th><th>应用</th><th>版本</th><th>Feedbacks</th><th>时间</th>
+      </tr></thead>
+      <tbody>${items.map(r => `
+        <tr>
+          <td style="font-family:var(--mono);font-size:12px;">${r.id?.substring(0,12)}...</td>
+          <td title="${esc(r.question||r.input||'')}">${esc((r.question||r.input||'')).substring(0,60)}</td>
+          <td>${esc(r.app_name||'')}</td>
+          <td>${esc(r.app_version||'')}</td>
+          <td>${Object.entries(r.feedbacks||{}).map(([k,v]) => `<span class="score ${scoreClass(v)}">${k}: ${fmtScore(v)}</span>`).join(' ') || '-'}</td>
+          <td>${r.created_at ? new Date(r.created_at).toLocaleString('zh-CN') : '-'}</td>
+        </tr>`).join('')}
+      </tbody></table>`;
+  } catch (e) {
+    lb.innerHTML = `<div class="error">加载失败: ${esc(e.message)}</div>`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Feedback
+// ═══════════════════════════════════════════════════════════
+async function loadFeedback() {
+  try {
+    const res = await fetch(`${FB_API}/stats?days=30`);
+    const data = await res.json();
+    const stats = data.data || {};
+
+    document.getElementById('fb-total').textContent = stats.total ?? 0;
+    document.getElementById('fb-praise-rate').textContent = stats.praise_rate != null ? (stats.praise_rate * 100).toFixed(1) + '%' : '-';
+    document.getElementById('fb-negative-rate').textContent = stats.negative_rate != null ? (stats.negative_rate * 100).toFixed(1) + '%' : '-';
+
+    // bar
+    const praise = stats.praise || 0;
+    const negative = stats.negative || 0;
+    const neutral = (stats.total || 0) - praise - negative;
+    const total = stats.total || 1;
+    document.getElementById('fb-bar').innerHTML = stats.total > 0 ? `
+      <span style="font-size:13px;color:var(--success);">👍 ${praise}</span>
+      <div class="bar-track">
+        <div class="bar-good" style="width:${(praise/total*100).toFixed(0)}%"></div>
+        <div class="bar-bad" style="width:${(negative/total*100).toFixed(0)}%"></div>
+      </div>
+      <span style="font-size:13px;color:var(--danger);">👎 ${negative}</span>
+    ` : '<span style="font-size:13px;">暂无反馈数据</span>';
+  } catch (e) {
+    document.getElementById('fb-total').textContent = '加载失败';
+  }
+}
+
+function esc(s) { return (s||'').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ═══════════════════════════════════════════════════════════
+// Init
+// ═══════════════════════════════════════════════════════════
+loadOnline();
+</script>
+</body>
+</html>

@@ -1,10 +1,10 @@
 # ============================================================
-# TruLens 会话配置 + LLM Provider（LLM-as-Judge）
+# TruLens 2.x 会话配置 + LLM Provider（LLM-as-Judge）
 # ★ 评估结果存入 PG 数据库 trulens_eval
 # ============================================================
 
 from trulens.core import TruSession
-from trulens_eval import LiteLLM
+from trulens.providers.litellm import LiteLLM
 
 from src.core.config import get_settings
 
@@ -32,16 +32,16 @@ def get_llm_provider() -> LiteLLM:
     )
 
 
-def launch_dashboard(port: int = 8501):
+def launch_dashboard(session: TruSession | None = None, port: int = 8501):
     """启动 TruLens Streamlit Dashboard"""
     from trulens.dashboard import run_dashboard
 
-    session = get_trulens_session()
-    run_dashboard(session=session, port=port)
+    s = session or get_trulens_session()
+    run_dashboard(session=s, port=port)
 
 
 if __name__ == "__main__":
     import sys
 
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8501
-    launch_dashboard(port)
+    launch_dashboard(port=port)

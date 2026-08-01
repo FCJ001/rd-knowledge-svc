@@ -32,9 +32,9 @@ async def multi_channel_search(
     channels: list[str] | None = None,
     role: str = "engineer",
     use_hyde: bool = False,
-) -> str:
+) -> dict:
     """
-    多通道并行检索 → 结果融合 → 幻觉检测 → 返回最终回答。
+    多通道并行检索 → 结果融合 → 幻觉检测 → 返回 {"answer": str, "contexts": list[str]}。
     """
     if channels is None:
         channels = ["doc_rag", "graph_rag"]
@@ -81,17 +81,24 @@ async def multi_channel_search(
 
     source_parts = []
     evidence_parts = []
+    retrieved_chunks = []  # 收集所有检索 chunks，供评测使用
 
     if doc_hits:
         ctx = format_doc_context(doc_hits)
         source_parts.append(f"### 文档检索结果\n{ctx}")
         evidence_parts.append(ctx[:1000])
+        for hit in doc_hits:
+            # hit 是 dict，text 字段存储子块内容，parent_text 是完整父块
+            text = hit.get("parent_text") or hit.get("text", "")
+            if text:
+                retrieved_chunks.append(text[:500])
 
     graph_records = results.get("graph_rag")
     if graph_records:
         graph_str = json.dumps(graph_records, ensure_ascii=False, indent=2)
         source_parts.append(f"### 知识图谱检索结果\n{graph_str}")
         evidence_parts.append(graph_str[:1000])
+        retrieved_chunks.append(graph_str[:2000])
 
     sql_answer = results.get("nl2sql")
     if sql_answer and isinstance(sql_answer, str):
@@ -99,7 +106,10 @@ async def multi_channel_search(
         evidence_parts.append(sql_answer[:1000])
 
     if not source_parts:
-        return "所有检索通道均未找到与您问题相关的信息。"
+        return {
+            "answer": "所有检索通道均未找到与您问题相关的信息。",
+            "contexts": [],
+        }
 
     sources = "\n\n".join(source_parts)
     prompt = FUSION_PROMPT.format(question=question, sources=sources, role=role)
@@ -112,4 +122,7 @@ async def multi_channel_search(
         claims = "、".join(hal_result.get("unsupported_claims", []))
         answer += f"\n\n⚠️ 提示：以下内容未在手册中完全印证：{claims}"
 
-    return answer
+    return {
+        "answer": answer,
+        "contexts": retrieved_chunks,
+    }

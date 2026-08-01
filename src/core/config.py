@@ -75,7 +75,19 @@ class Settings(BaseSettings):
     ALM_DB_NAME: str = "rd_agent"
 
     # ---------------- TruLens ----------------
-    TRULENS_ENABLED: bool = False
+    TRULENS_ENABLED: bool = True
+
+    # ---------------- 在线评测采样 ----------------
+    EVAL_SAMPLE_RATE: float = 1  # 在线 LLM-as-Judge 采样率，0.1 = 10%
+
+    # ---------------- Guardrails ----------------
+    GUARDRAILS_ENABLED: bool = True
+    GUARDRAILS_BLOCK_DDL: bool = True  # 拦截 DROP/TRUNCATE/ALTER
+    GUARDRAILS_BLOCK_DML_WITHOUT_WHERE: bool = True  # 拦截无 WHERE 的 DELETE/UPDATE
+
+    # ---------------- 模型定价（USD/1M tokens）----------------
+    MODEL_PRICING_INPUT: float = 0.4   # qwen-max 输入 $0.4/1M
+    MODEL_PRICING_OUTPUT: float = 1.2  # qwen-max 输出 $1.2/1M
 
     # ---------------- 日志 ----------------
     LOG_LEVEL: str = "DEBUG"

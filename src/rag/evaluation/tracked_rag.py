@@ -18,6 +18,8 @@ from pymilvus import MilvusClient
 from sqlalchemy.ext.asyncio import AsyncSession
 from trulens.core.otel.instrument import SpanAttributes, instrument
 
+from src.rag.evaluation.token_tracker import TokenTracker
+
 SpanType = SpanAttributes.SpanType
 
 
@@ -35,12 +37,17 @@ class TrackedRAG:
         role: str = "engineer",
     ):
         self.channel = channel
-        self.llm = llm
         self.embedding_model = embedding_model
         self.milvus_client = milvus_client
         self.neo4j_driver = neo4j_driver
         self.db_session = db_session
         self.role = role
+        self._token_tracker = TokenTracker()
+        self.llm = llm.with_config({"callbacks": [self._token_tracker]})
+
+    @property
+    def token_usage(self) -> dict:
+        return self._token_tracker.usage
 
     @instrument(
         span_type=SpanType.RETRIEVAL,

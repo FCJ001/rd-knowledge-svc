@@ -14,10 +14,14 @@ from src.api.deps import get_llm, get_embedding_model
 from src.core.base_schema import PageResult, ResponseSchema
 from src.core.deps import PageParams, UserContext, get_current_user
 from src.core.exceptions import ERR_BAD_REQUEST, ERR_NOT_FOUND, BizException
+from src.core.logger import logger
 from src.infra.db import get_db
 from src.infra.milvus_client import get_milvus_client
 from src.infra.neo4j_client import get_neo4j_driver
 from src.knowledge.model import KnowledgeDoc, KnowledgeFeedback
+from src.rag.evaluation.async_tracker import get_async_evaluator
+from src.rag.evaluation.guardrails import check_output
+from src.rag.evaluation.token_tracker import TokenTracker
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["知识检索"])
 
@@ -64,9 +68,13 @@ async def search_knowledge(
     milvus_client = get_milvus_client()
     neo4j_driver = get_neo4j_driver()
 
+    # ── Token 追踪 ──
+    token_tracker = TokenTracker()
+    llm = llm.with_config({"callbacks": [token_tracker]})
+
     from src.knowledge.fusion import multi_channel_search
 
-    answer = await multi_channel_search(
+    result = await multi_channel_search(
         question=req.question,
         llm=llm,
         embedding_model=embedding_model,
@@ -75,6 +83,25 @@ async def search_knowledge(
         db_session=db if "nl2sql" in req.channels else None,
         channels=req.channels,
         role=user.role,
+    )
+    answer = result["answer"] if isinstance(result, dict) else result
+    contexts = result.get("contexts", []) if isinstance(result, dict) else []
+
+    # ── Guardrails 输出检查 ──
+    safe, reason = check_output(answer)
+    if not safe:
+        logger.warning(f"[Guardrails] 知识检索输出检查: {reason}")
+
+    # ── 异步评估（fire-and-forget，按采样率触发）──
+    evaluator = get_async_evaluator()
+    evaluator.evaluate_knowledge(question=req.question, answer=answer, contexts=contexts, token_usage=token_tracker.usage)
+
+    # ── Token 用量 ──
+    usage = token_tracker.usage
+    logger.info(
+        f"[Token] 知识检索 input={usage['input_tokens']} output={usage['output_tokens']} "
+        f"total={usage['total_tokens']} calls={usage['calls']} "
+        f"cost=${usage['cost_usd']:.6f}"
     )
 
     return ResponseSchema(data=SearchResponse(
