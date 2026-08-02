@@ -61,20 +61,22 @@ async def upload_doc(
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名为空")
 
-    # 保存到临时文件
+    # 保存到临时文件（1MB 分块流式写，大文件不整块驻留内存）
     suffix = Path(file.filename).suffix or ".pdf"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
+        while chunk := await file.read(1024 * 1024):
+            tmp.write(chunk)
         tmp_path = tmp.name
 
     try:
         # 上传到 MinIO
         minio_key = None
         try:
+            from src.core.config import get_settings
             from src.infra.minio_client import get_minio_client
             minio_client = get_minio_client()
             minio_key = f"{doc_type}/{model_code or 'common'}/{file.filename}"
-            minio_client.fput_object("knowledge-docs", minio_key, tmp_path)
+            minio_client.fput_object(get_settings().MINIO_BUCKET, minio_key, tmp_path)
             logger.info(f"MinIO 上传完成: {minio_key}")
         except Exception as e:
             logger.warning(f"MinIO 上传失败（继续入库）: {e}")
