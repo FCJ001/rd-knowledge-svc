@@ -24,3 +24,7 @@ logs/
 
 # 文档
 docs/
+
+# 运行产物
+default.sqlite
+nl2sql_eval_*.json
