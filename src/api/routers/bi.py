@@ -223,6 +223,13 @@ async def bi_query_stream(
                 node_data = event.get(node_name, {})
                 safe_data = _make_json_safe(node_data)
 
+                payload = {
+                    "node": node_name,
+                    "step": node_count,
+                    "trace_id": bi_trace_id,
+                    "data": safe_data if safe_data else {},
+                }
+
                 if node_name == "execute_sql" and isinstance(node_data, dict):
                     last_result = node_data
                     # Guardrails — SQL 安全检查
@@ -231,13 +238,6 @@ async def bi_query_stream(
                     if not safe:
                         logger.warning(f"[Guardrails] {reason} | SQL: {sql_text[:200]}")
                         payload["guard"] = {"passed": False, "reason": reason}
-
-                payload = {
-                    "node": node_name,
-                    "step": node_count,
-                    "trace_id": bi_trace_id,
-                    "data": safe_data if safe_data else {},
-                }
 
                 if node_name == "execute_sql" and isinstance(node_data, dict) and node_data.get("result_data"):
                     try:

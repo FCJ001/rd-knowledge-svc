@@ -51,12 +51,50 @@ class IngestionPipeline:
         self.parser = DocumentParser(parser=parser)
         self._ensure_collection()
 
+    def _collection_has_bm25(self) -> bool:
+        """检测已有 collection 是否含 BM25 Function。
+
+        幂等安全：describe_collection 失败或无法确认时，保守返回 True（不删除），
+        避免把已有文档数据误删。"""
+        try:
+            desc = self.milvus.describe_collection(COLLECTION_NAME)
+        except Exception as e:
+            logger.warning(f"describe_collection 失败，保守跳过重建: {e}")
+            return True
+
+        if not isinstance(desc, dict):
+            return True
+
+        # 兼容 describe_collection 返回结构：functions 可能在顶层或嵌套在 schema 下
+        candidates = [desc]
+        schema = desc.get("schema")
+        if isinstance(schema, dict):
+            candidates.append(schema)
+
+        for cfg in candidates:
+            for f in cfg.get("functions") or []:
+                if not isinstance(f, dict):
+                    continue
+                name = str(f.get("name", "")).lower()
+                ftype = f.get("type")
+                if name == "bm25" or ftype in (FunctionType.BM25.value, "BM25"):
+                    return True
+        return False
+
     def _ensure_collection(self) -> None:
-        """确保 alm_docs collection 存在，含 BM25 Function（与天宫医疗一致）
-        旧版 collection（手动 BM25 schema）会被自动删除重建。"""
+        """确保 alm_docs collection 存在，含 BM25 Function（与天宫医疗一致）。
+        幂等：已存在且含 BM25 Function 则跳过；
+        仅旧版 collection（无 BM25 Function）才删除重建，避免每次实例化都清空索引。"""
         if self.milvus.has_collection(COLLECTION_NAME):
+            if self._collection_has_bm25():
+                logger.info(
+                    f"collection '{COLLECTION_NAME}' 已存在且含 BM25 Function，跳过重建"
+                )
+                return
             self.milvus.drop_collection(COLLECTION_NAME)
-            logger.info(f"已删除旧版 collection '{COLLECTION_NAME}'，将重建（含 BM25 Function）")
+            logger.info(
+                f"旧版 collection '{COLLECTION_NAME}'（无 BM25 Function），删除重建"
+            )
 
         schema = MilvusClient.create_schema(auto_id=False)
         schema.add_field("id", DataType.VARCHAR, max_length=256, is_primary=True)

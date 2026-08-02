@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     TRULENS_ENABLED: bool = True
 
     # ---------------- 在线评测采样 ----------------
-    EVAL_SAMPLE_RATE: float = 1  # 在线 LLM-as-Judge 采样率，0.1 = 10%
+    EVAL_SAMPLE_RATE: float = 0.1  # 在线 LLM-as-Judge 采样率，0.1 = 10%
 
     # ---------------- Guardrails ----------------
     GUARDRAILS_ENABLED: bool = True
