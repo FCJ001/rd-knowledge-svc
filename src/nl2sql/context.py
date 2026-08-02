@@ -29,3 +29,6 @@ class DataAgentContext(TypedDict, total=False):
     pg_meta_repo: PgMetaRepository
     dw_db_session: AsyncSession
     writer: Callable[[dict[str, Any]], None]  # 进度/结果推送回调
+    role: str = "engineer"  # 认证用户角色 → execute_sql 行级过滤
+    owner_domain_id: int | None = None
+    business_line: str | None = None

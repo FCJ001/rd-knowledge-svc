@@ -89,10 +89,17 @@ async def generate_sql(
     return sql
 
 
+async def setup_readonly_session(db: AsyncSession) -> None:
+    """执行前设置会话安全属性：超时 + 只读（第四层防线）。
+
+    供旧引擎与流水线 execute_sql 节点共用，保证两条路径行为一致。"""
+    await db.execute(text(f"SET LOCAL statement_timeout = '{SQL_TIMEOUT * 1000}'"))
+    await db.execute(text("SET LOCAL default_transaction_read_only = on"))
+
+
 async def execute_sql(sql: str, db: AsyncSession) -> tuple[list[dict], list[str]]:
     """执行 SQL，返回 (rows, columns)"""
-    await db.execute(text(f"SET LOCAL statement_timeout = '{SQL_TIMEOUT * 1000}'"))
-    await db.execute(text("SET LOCAL default_transaction_read_only = on"))  # ★ 第四层安全
+    await setup_readonly_session(db)
     result = await db.execute(text(sql))
     columns = list(result.keys())
     rows = [dict(row) for row in result.mappings().all()]

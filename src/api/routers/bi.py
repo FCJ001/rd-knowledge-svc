@@ -177,6 +177,11 @@ async def bi_query_stream(
     import asyncio as _asyncio
     ctx, knowledge_db, token_tracker = await _build_pipeline_context(alm_db)
 
+    # 认证用户的角色/域/业务线 → execute_sql 节点做行级过滤
+    ctx["role"] = user.role
+    ctx["owner_domain_id"] = user.owner_domain_id
+    ctx["business_line"] = user.business_line
+
     # 获取全链路 trace_id（由 logging middleware 注入）
     bi_trace_id = trace_id_var.get()
 
