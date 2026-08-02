@@ -111,6 +111,7 @@ class AsyncEvaluator:
         settings = get_settings()
         self.enabled = settings.TRULENS_ENABLED
         self.sample_rate = settings.EVAL_SAMPLE_RATE
+        self._table_ready = False  # 同一进程只建表/加列一次，避免每条评分都跑 13 条 DDL
 
         if self.enabled:
             self._llm = ChatOpenAI(
@@ -134,6 +135,56 @@ class AsyncEvaluator:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    async def _ensure_table(self, conn) -> None:
+        """建表 + 兼容旧表加列。只在首次写库前执行一次，避免每条评分重复跑 13 条 DDL。"""
+        if self._table_ready:
+            return
+        from sqlalchemy import text
+
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS online_scores (
+                id SERIAL PRIMARY KEY,
+                eval_type VARCHAR(20) DEFAULT 'nl2sql',
+                question TEXT NOT NULL,
+                answer TEXT DEFAULT '',
+                sql TEXT DEFAULT '',
+                summary TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                score_sql_valid REAL DEFAULT 0,
+                score_relevance REAL DEFAULT 0,
+                score_reason TEXT DEFAULT '',
+                score_has_data REAL DEFAULT 0,
+                score_context_relevance REAL DEFAULT 0,
+                score_context_relevance_reason TEXT DEFAULT '',
+                score_groundedness REAL DEFAULT 0,
+                score_groundedness_reason TEXT DEFAULT '',
+                token_input INTEGER DEFAULT 0,
+                token_output INTEGER DEFAULT 0,
+                token_calls INTEGER DEFAULT 0,
+                token_cost_usd REAL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        # 兼容旧表：尝试加列
+        for col_sql in [
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS eval_type VARCHAR(20) DEFAULT 'nl2sql'",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS answer TEXT DEFAULT ''",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_has_data REAL DEFAULT 0",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_context_relevance REAL DEFAULT 0",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_context_relevance_reason TEXT DEFAULT ''",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_groundedness REAL DEFAULT 0",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_groundedness_reason TEXT DEFAULT ''",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_input INTEGER DEFAULT 0",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_output INTEGER DEFAULT 0",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_calls INTEGER DEFAULT 0",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_cost_usd REAL DEFAULT 0",
+        ]:
+            try:
+                await conn.execute(text(col_sql))
+            except Exception:
+                pass
+        self._table_ready = True
 
     def evaluate(
         self,
@@ -205,47 +256,7 @@ class AsyncEvaluator:
 
         try:
             async with self._engine.begin() as conn:
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS online_scores (
-                        id SERIAL PRIMARY KEY,
-                        eval_type VARCHAR(20) DEFAULT 'nl2sql',
-                        question TEXT NOT NULL,
-                        answer TEXT DEFAULT '',
-                        sql TEXT DEFAULT '',
-                        summary TEXT DEFAULT '',
-                        error TEXT DEFAULT '',
-                        score_sql_valid REAL DEFAULT 0,
-                        score_relevance REAL DEFAULT 0,
-                        score_reason TEXT DEFAULT '',
-                        score_has_data REAL DEFAULT 0,
-                        score_context_relevance REAL DEFAULT 0,
-                        score_context_relevance_reason TEXT DEFAULT '',
-                        score_groundedness REAL DEFAULT 0,
-                        score_groundedness_reason TEXT DEFAULT '',
-                        token_input INTEGER DEFAULT 0,
-                        token_output INTEGER DEFAULT 0,
-                        token_calls INTEGER DEFAULT 0,
-                        token_cost_usd REAL DEFAULT 0,
-                        created_at TIMESTAMP DEFAULT NOW()
-                    )
-                """))
-                for col_sql in [
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS eval_type VARCHAR(20) DEFAULT 'nl2sql'",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS answer TEXT DEFAULT ''",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_has_data REAL DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_context_relevance REAL DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_context_relevance_reason TEXT DEFAULT ''",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_groundedness REAL DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_groundedness_reason TEXT DEFAULT ''",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_input INTEGER DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_output INTEGER DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_calls INTEGER DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_cost_usd REAL DEFAULT 0",
-                ]:
-                    try:
-                        await conn.execute(text(col_sql))
-                    except Exception:
-                        pass
+                await self._ensure_table(conn)
 
                 await conn.execute(
                     text("""
@@ -379,48 +390,7 @@ class AsyncEvaluator:
 
         try:
             async with self._engine.begin() as conn:
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS online_scores (
-                        id SERIAL PRIMARY KEY,
-                        eval_type VARCHAR(20) DEFAULT 'nl2sql',
-                        question TEXT NOT NULL,
-                        answer TEXT DEFAULT '',
-                        sql TEXT DEFAULT '',
-                        summary TEXT DEFAULT '',
-                        error TEXT DEFAULT '',
-                        score_sql_valid REAL DEFAULT 0,
-                        score_relevance REAL DEFAULT 0,
-                        score_reason TEXT DEFAULT '',
-                        score_has_data REAL DEFAULT 0,
-                        score_context_relevance REAL DEFAULT 0,
-                        score_context_relevance_reason TEXT DEFAULT '',
-                        score_groundedness REAL DEFAULT 0,
-                        score_groundedness_reason TEXT DEFAULT '',
-                        token_input INTEGER DEFAULT 0,
-                        token_output INTEGER DEFAULT 0,
-                        token_calls INTEGER DEFAULT 0,
-                        token_cost_usd REAL DEFAULT 0,
-                        created_at TIMESTAMP DEFAULT NOW()
-                    )
-                """))
-                # 兼容旧表：尝试加列
-                for col_sql in [
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS eval_type VARCHAR(20) DEFAULT 'nl2sql'",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS answer TEXT DEFAULT ''",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_has_data REAL DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_context_relevance REAL DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_context_relevance_reason TEXT DEFAULT ''",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_groundedness REAL DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS score_groundedness_reason TEXT DEFAULT ''",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_input INTEGER DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_output INTEGER DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_calls INTEGER DEFAULT 0",
-                    "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_cost_usd REAL DEFAULT 0",
-                ]:
-                    try:
-                        await conn.execute(text(col_sql))
-                    except Exception:
-                        pass
+                await self._ensure_table(conn)
 
                 await conn.execute(
                     text("""

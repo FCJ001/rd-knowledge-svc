@@ -21,9 +21,42 @@ FORBIDDEN_PATTERNS = [
 ]
 
 
+def _remove_trailing_line_comment(sql: str) -> str:
+    """移除语句末尾的 `--` 行注释（跳过字符串字面量内的 `--`）。
+
+    若不移除，后面追加的 `LIMIT 100` 会被注释吞掉而被数据库忽略
+    （如 `SELECT * FROM t -- 备注` + ` LIMIT 100` → LIMIT 成了注释内容），
+    从而绕过行数上限，可查全表。"""
+    in_str: str | None = None  # "'" 或 '"'，None 表示不在字符串内
+    last_comment = -1
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if in_str:
+            if ch == in_str:
+                # 处理 SQL 转义引号（'' / ""）
+                if i + 1 < n and sql[i + 1] == in_str:
+                    i += 2
+                    continue
+                in_str = None
+        else:
+            if ch in ("'", '"'):
+                in_str = ch
+            elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
+                last_comment = i
+                i += 1
+        i += 1
+    # 只有注释延伸到字符串末尾（其后无换行）才是尾部注释，才截断
+    if last_comment >= 0 and "\n" not in sql[last_comment:]:
+        return sql[:last_comment].rstrip()
+    return sql
+
+
 def validate_sql(sql: str) -> tuple[bool, str]:
     """校验 SQL 安全性。返回 (is_valid, validated_sql_or_error)"""
     stripped = sql.strip().rstrip(";")
+    stripped = _remove_trailing_line_comment(stripped)
 
     if not stripped.upper().startswith("SELECT"):
         return False, "只允许 SELECT 查询"
