@@ -71,6 +71,10 @@ class TrackedNL2SQL:
             "es_value_repo": ESValueRepository(es_client),
             "pg_meta_repo": pg_meta_repo,
             "dw_db_session": dw_db_session,
+            # 与流水线一致：execute_sql 节点做角色行级过滤
+            "role": role,
+            "owner_domain_id": owner_domain_id,
+            "business_line": business_line,
         }
 
         # 流水线中间状态（retrieve → generate 之间传递）

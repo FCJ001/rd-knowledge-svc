@@ -7,6 +7,7 @@
 # DELETE /api/v1/bi/history/{session_id}    清除对话历史
 # ============================================================
 
+import asyncio
 import json
 
 from fastapi import APIRouter, Depends, Request
@@ -25,6 +26,7 @@ from src.infra.milvus_client import get_milvus_client
 from src.nl2sql.chart_advisor import recommend_chart
 from src.nl2sql.echarts_builder import to_echarts_option
 from src.nl2sql.engine import ConversationContext, run_query
+from src.nl2sql.pipeline import run_pipeline
 from src.nl2sql.repositories import (
     PgMetaRepository,
     MilvusColumnRepository,
@@ -174,7 +176,6 @@ async def bi_query_stream(
     alm_db: AsyncSession = Depends(get_db_readonly),
 ):
     """自然语言数据查询 — SSE 流式返回各节点执行状态 + 最终结果"""
-    import asyncio as _asyncio
     ctx, knowledge_db, token_tracker = await _build_pipeline_context(alm_db)
 
     # 认证用户的角色/域/业务线 → execute_sql 节点做行级过滤
@@ -185,10 +186,8 @@ async def bi_query_stream(
     # 获取全链路 trace_id（由 logging middleware 注入）
     bi_trace_id = trace_id_var.get()
 
-    from src.nl2sql.pipeline import run_pipeline
-
     async def event_stream():
-        queue: _asyncio.Queue = _asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue()
 
         # 注入 writer 回调，节点通过它推送进度/结果事件
         def writer(msg: dict):
@@ -205,7 +204,7 @@ async def bi_query_stream(
             finally:
                 await queue.put(None)  # sentinel
 
-        task = _asyncio.ensure_future(run_to_queue())
+        task = asyncio.ensure_future(run_to_queue())
 
         # 保存 execute_sql 节点的结果，用于最终评估
         last_result: dict = {}
