@@ -23,3 +23,5 @@
 3. 生成一条 SQL 语句
 4. 输出纯 SQL 文本，不要 markdown 代码块
 5. 不要加角色相关的 WHERE 条件（系统自动注入）
+6. 按外键/维度字段分组或展示时，必须 JOIN 对应维度表取可读名称，禁止直接展示数字 ID。
+   例：按责任域分组 → JOIN owner_domains ON alm_issues.owner_domain_id = owner_domains.id，SELECT/GROUP BY owner_domains.name 而非 owner_domain_id

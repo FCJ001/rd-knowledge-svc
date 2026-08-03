@@ -64,7 +64,8 @@ tables:
       - name: owner_domain_id
         type: BIGINT
         role: foreign_key
-        description: 关联责任域ID
+        description: 责任域ID，维表 owner_domains.id → owner_domains.name（域名称，如 电池系统域）；按域分组/展示时 JOIN owner_domains 取 name
+        alias: ["域", "责任方", "模块"]
       - name: external_ref
         type: VARCHAR(100)
         role: dimension
@@ -118,11 +119,13 @@ tables:
       - name: target_baseline_id
         type: BIGINT
         role: foreign_key
-        description: 关联基线ID
+        description: 基线ID，维表 alm_baselines.id → alm_baselines.name（基线名称）；按基线分组/展示时 JOIN alm_baselines 取 name
+        alias: ["基线", "基线名"]
       - name: source_issue_id
         type: BIGINT
         role: foreign_key
-        description: 来源问题ID
+        description: 来源问题ID，维表 alm_issues.id → alm_issues.issue_no（问题单号）；展示来源问题时 JOIN alm_issues 取 issue_no
+        alias: ["来源问题", "关联问题"]
       - name: created_at
         type: TIMESTAMP
         role: date
@@ -239,7 +242,8 @@ tables:
       - name: baseline_id
         type: BIGINT
         role: foreign_key
-        description: 关联基线ID
+        description: 基线ID，维表 alm_baselines.id → alm_baselines.name（基线名称）；按基线分组/展示时 JOIN alm_baselines 取 name
+        alias: ["基线", "基线名"]
       - name: created_at
         type: TIMESTAMP
         role: date

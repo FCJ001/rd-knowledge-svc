@@ -12,6 +12,7 @@
    - 问题涉及的维度列（分组/过滤用）
    - 涉及的时间列（时间范围/趋势用）
    - 涉及的指标/度量列（统计用）
+6. 选中外键列（如 owner_domain_id/target_baseline_id/source_issue_id/baseline_id）用于分组或展示时，必须同时选中其维度表（owner_domains/alm_baselines/alm_issues）以取可读名称
 
 ## 输出
 纯 JSON 对象，格式：{"table_name": ["col1", "col2"], ...}
