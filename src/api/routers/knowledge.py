@@ -36,6 +36,7 @@ class SearchRequest(BaseModel):
     )
     doc_type: str = Field(default="", description="文档类型过滤: repair_manual/spec_doc/tsb/issue_case")
     model_code: str = Field(default="", description="车型代码过滤")
+    use_hyde: bool = Field(default=False, description="是否启用 HyDE（假设性文档嵌入，默认关）")
 
 
 class SearchResponse(BaseModel):
@@ -72,20 +73,34 @@ async def search_knowledge(
     token_tracker = TokenTracker()
     llm = llm.with_config({"callbacks": [token_tracker]})
 
+    from src.knowledge.audit import QueryAuditLog, Timer
     from src.knowledge.fusion import multi_channel_search
 
-    result = await multi_channel_search(
-        question=req.question,
-        llm=llm,
-        embedding_model=embedding_model,
-        milvus_client=milvus_client,
-        neo4j_driver=neo4j_driver,
-        db_session=db if "nl2sql" in req.channels else None,
-        channels=req.channels,
-        role=user.role,
-    )
+    with Timer() as timer:
+        result = await multi_channel_search(
+            question=req.question,
+            llm=llm,
+            embedding_model=embedding_model,
+            milvus_client=milvus_client,
+            neo4j_driver=neo4j_driver,
+            db_session=db if "nl2sql" in req.channels else None,
+            channels=req.channels,
+            role=user.role,
+            use_hyde=req.use_hyde,
+        )
     answer = result["answer"] if isinstance(result, dict) else result
     contexts = result.get("contexts", []) if isinstance(result, dict) else []
+
+    # ── 查询审计日志（检索链路在 API 端点落审计）──
+    QueryAuditLog.log(
+        user_id=user.user_id,
+        role=user.role,
+        question=req.question,
+        intent="multi_channel",
+        channels=req.channels,
+        answer_preview=answer,
+        duration_ms=timer.elapsed_ms,
+    )
 
     # ── Guardrails 输出检查 ──
     safe, reason = check_output(answer)

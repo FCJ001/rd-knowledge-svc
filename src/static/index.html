@@ -382,7 +382,7 @@ body {
         <button class="search-btn" id="searchBtn" onclick="doSearch()">➤</button>
       </div>
       <div class="search-opts">
-        <label><input type="checkbox" value="doc_rag" checked onchange="store.channels=selectedChannels()"> 文档 RAG</label>
+        <label><input type="checkbox" value="doc_rag" checked onchange="store.channels=selectedChannels();syncHydeDisabled()"> 文档 RAG</label>
         <label><input type="checkbox" value="graph_rag" checked onchange="store.channels=selectedChannels()"> 图谱 RAG</label>
         <label><input type="checkbox" value="nl2sql" onchange="store.channels=selectedChannels()"> NL2SQL</label>
         <span style="font-size:12px;color:var(--muted)">|</span>
@@ -394,6 +394,7 @@ body {
           <option value="issue_case">问题案例</option>
         </select>
         <input type="text" id="modelCode" placeholder="车型代码" oninput="store.modelCode=this.value" style="width:100px;">
+        <label title="文档检索专用：用 LLM 生成假设回答再检索，提升语义召回（多一次模型调用，更慢）"><input type="checkbox" id="useHyde" onchange="store.useHyde=this.checked"> HyDE</label>
       </div>
       <div id="searchResults"></div>
     </div>
@@ -492,6 +493,7 @@ const store = {
   channels: ['doc_rag','graph_rag'],
   docType: '',
   modelCode: '',
+  useHyde: false,
   biSession: 'default',
   lastSearchAnswer: '',    // for feedback
   lastSearchQuestion: '',
@@ -512,6 +514,7 @@ function init() {
   if (store.theme === 'dark') document.documentElement.setAttribute('data-theme','dark');
   checkHealth();
   renderHistory();
+  syncHydeDisabled();
 }
 
 function checkHealth() {
@@ -560,7 +563,18 @@ function renderHistory() {
    Page 1: Knowledge Search
    ══════════════════════════════════════════════════════════════ */
 function selectedChannels() {
-  return [...document.querySelectorAll('.search-opts input[type=checkbox]:checked')].map(c=>c.value);
+  return [...document.querySelectorAll('.search-opts input[type=checkbox][value]:checked')].map(c=>c.value);
+}
+
+/* HyDE 依赖 doc_rag：未勾选文档检索时禁用并复位 */
+function syncHydeDisabled() {
+  const hyde = document.getElementById('useHyde');
+  const docRagOn = store.channels.includes('doc_rag');
+  hyde.disabled = !docRagOn;
+  if (!docRagOn) {
+    hyde.checked = false;
+    store.useHyde = false;
+  }
 }
 
 async function doSearch() {
@@ -579,7 +593,7 @@ async function doSearch() {
     const resp = await fetch(BASE+'/api/v1/knowledge/search',{
       method:'POST',
       headers:{'Content-Type':'application/json','X-User-Id':'web','X-User-Role':store.role},
-      body: JSON.stringify({question:q, channels:store.channels, doc_type:store.docType, model_code:store.modelCode})
+      body: JSON.stringify({question:q, channels:store.channels, doc_type:store.docType, model_code:store.modelCode, use_hyde:store.useHyde})
     });
     const json = await resp.json();
     const data = json.data;
