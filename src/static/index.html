@@ -1194,23 +1194,34 @@ function renderTableBlock(block) {
 
 function renderMarkdown(text) {
   if (!text) return '';
-  return text
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    // 内联图片：![alt](http://...) → <img>（alt/src 已转义，引号再单独转义防属性逃逸）
-    .replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (m, alt, url) =>
-      `<a href="${url.replace(/"/g,'&quot;')}" target="_blank" rel="noopener"><img class="rc-inline-img" loading="lazy" alt="${alt.replace(/"/g,'&quot;')}" src="${url.replace(/"/g,'&quot;')}"></a>`)
-    .replace(/^### (.+)$/gm,'<h3>$1</h3>')
-    .replace(/^## (.+)$/gm,'<h2>$1</h2>')
-    .replace(/^# (.+)$/gm,'<h1>$1</h1>')
-    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
-    .replace(/`([^`]+)`/g,'<code>$1</code>')
-    .replace(/^\- (.+)$/gm,'<li>$1</li>')
-    .replace(/((?:\n<li>.+<\/li>)+)/g,'\n<ul>$1</ul>\n')
-    // markdown 表格：连续以 | 开头的行 → <table>（须在 <br> 转换前）
-    .replace(/(^[ \t]*\|.*\|\s*$\n?)+/gm, renderTableBlock)
-    .replace(/\n{2,}/g,'\n\n')
-    .replace(/\n/g,'<br>')
-    .replace(/---/g,'<hr>');
+  // 保护多行公式块 $$...$$ 和 \[...\]：先抽出占位，避免换行被 <br> 拆散定界符
+  const mathBlocks = [];
+  const saveMath = (t) => t
+    .replace(/\$\$[\s\S]+?\$\$/g, m => { mathBlocks.push(m); return `\u0001M${mathBlocks.length-1}\u0001`; })
+    .replace(/\\\[[\s\S]+?\\\]/g, m => { mathBlocks.push(m); return `\u0001M${mathBlocks.length-1}\u0001`; });
+  // 还原时补 HTML 转义：&<> 转义后浏览器解码成文本，KaTeX 读到真实公式
+  const restoreMath = (t) => t.replace(/\u0001M(\d+)\u0001/g, (_, i) =>
+    mathBlocks[+i].replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'));
+
+  return restoreMath(
+    saveMath(text)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      // 内联图片：![alt](http://...) → <img>（alt/src 已转义，引号再单独转义防属性逃逸）
+      .replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (m, alt, url) =>
+        `<a href="${url.replace(/"/g,'&quot;')}" target="_blank" rel="noopener"><img class="rc-inline-img" loading="lazy" alt="${alt.replace(/"/g,'&quot;')}" src="${url.replace(/"/g,'&quot;')}"></a>`)
+      .replace(/^### (.+)$/gm,'<h3>$1</h3>')
+      .replace(/^## (.+)$/gm,'<h2>$1</h2>')
+      .replace(/^# (.+)$/gm,'<h1>$1</h1>')
+      .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+      .replace(/`([^`]+)`/g,'<code>$1</code>')
+      .replace(/^\- (.+)$/gm,'<li>$1</li>')
+      .replace(/((?:\n<li>.+<\/li>)+)/g,'\n<ul>$1</ul>\n')
+      // markdown 表格：连续以 | 开头的行 → <table>（须在 <br> 转换前）
+      .replace(/(^[ \t]*\|.*\|\s*$\n?)+/gm, renderTableBlock)
+      .replace(/\n{2,}/g,'\n\n')
+      .replace(/\n/g,'<br>')
+      .replace(/---/g,'<hr>')
+  );
 }
 
 /* LaTeX 公式渲染：KaTeX auto-render（defer 脚本加载后 renderMathInElement 才可用，运行时判空） */
