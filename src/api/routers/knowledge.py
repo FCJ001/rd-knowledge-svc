@@ -22,6 +22,7 @@ from src.core.exceptions import ERR_BAD_REQUEST, ERR_NOT_FOUND, BizException
 from src.core.logger import logger
 from src.core.rate_limit import check_rate_limit
 from src.infra.db import get_db
+from src.infra.db_readonly import get_db_readonly
 from src.infra.milvus_client import get_milvus_client
 from src.infra.neo4j_client import get_neo4j_driver
 from src.knowledge.model import KnowledgeDoc, KnowledgeFeedback
@@ -68,7 +69,8 @@ async def search_knowledge(
     req: SearchRequest,
     rate_limit: None = Depends(check_rate_limit),
     user: UserContext = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    # ★ nl2sql 通道查 ALM 业务库（alm_issues 等），必须用只读 session 而非自有库
+    alm_db: AsyncSession = Depends(get_db_readonly),
 ):
     """多通道知识检索：文档 + 图谱 + NL2SQL 并行查询（命中查询缓存则直接返回）"""
     cache_key = build_search_cache_key(
@@ -120,7 +122,7 @@ async def search_knowledge(
             embedding_model=embedding_model,
             milvus_client=milvus_client,
             neo4j_driver=neo4j_driver,
-            db_session=db if "nl2sql" in req.channels else None,
+            db_session=alm_db if "nl2sql" in req.channels else None,
             channels=req.channels,
             role=user.role,
             use_hyde=req.use_hyde,
@@ -173,7 +175,8 @@ async def search_knowledge_stream(
     request: Request,
     rate_limit: None = Depends(check_rate_limit),
     user: UserContext = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    # ★ nl2sql 通道查 ALM 业务库，必须用只读 session
+    alm_db: AsyncSession = Depends(get_db_readonly),
 ):
     """多通道知识检索 — SSE 流式：检索进度事件 + 答案 token 流式输出。
 
@@ -211,7 +214,7 @@ async def search_knowledge_stream(
                     embedding_model=embedding_model,
                     milvus_client=milvus_client,
                     neo4j_driver=neo4j_driver,
-                    db_session=db if "nl2sql" in req.channels else None,
+                    db_session=alm_db if "nl2sql" in req.channels else None,
                     channels=req.channels,
                     role=user.role,
                     use_hyde=req.use_hyde,
