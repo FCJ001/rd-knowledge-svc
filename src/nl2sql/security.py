@@ -54,11 +54,29 @@ def _remove_trailing_line_comment(sql: str) -> str:
 
 
 def validate_sql(sql: str) -> tuple[bool, str]:
-    """校验 SQL 安全性。返回 (is_valid, validated_sql_or_error)"""
+    """校验 SQL 安全性。返回 (is_valid, validated_sql_or_error)
+
+    用 sqlglot 做语句级解析，彻底替代 startswith("SELECT")：
+    - ★ 强制单条语句：asyncpg prepared statement 不支持多命令，且多语句是注入面。
+       LLM 面对复合提问可能用分号拼接多条 SELECT，直接拒绝并给出明确提示。
+    - 语句类型必须是 SELECT（含 WITH ... SELECT，sqlglot 中 WITH 挂在 Select 节点上）。
+    """
     stripped = sql.strip().rstrip(";")
     stripped = _remove_trailing_line_comment(stripped)
+    if not stripped:
+        return False, "SQL 为空"
 
-    if not stripped.upper().startswith("SELECT"):
+    try:
+        statements = sqlglot.parse(stripped, dialect="postgres")
+    except Exception:
+        return False, "SQL 解析失败"
+    if not statements:
+        return False, "SQL 解析失败"
+
+    if len(statements) > 1:
+        return False, "只允许单条 SELECT 语句，请把多个查询拆开"
+
+    if not isinstance(statements[0], exp.Select):
         return False, "只允许 SELECT 查询"
 
     for pattern in FORBIDDEN_PATTERNS:

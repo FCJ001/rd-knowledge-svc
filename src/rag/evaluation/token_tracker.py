@@ -49,8 +49,10 @@ class TokenTracker(BaseCallbackHandler):
             for gen in response.generations:
                 for g in gen:
                     msg = getattr(g, "message", None)
-                    if msg and hasattr(msg, "usage_metadata"):
-                        um = msg.usage_metadata
+                    # ★ usage_metadata 默认是 None，hasattr 恒为 True → 需判空，
+                    #    否则 um.get() 抛 AttributeError，回调被 LangChain 吞掉、指标静默丢失
+                    um = getattr(msg, "usage_metadata", None) if msg else None
+                    if um:
                         input_tokens += um.get("input_tokens", 0)
                         output_tokens += um.get("output_tokens", 0)
 

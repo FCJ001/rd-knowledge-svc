@@ -46,6 +46,26 @@ def test_existing_limit_not_duplicated():
     assert sql.count("LIMIT") == 1
 
 
+def test_multi_statement_rejected():
+    # LLM 面对复合提问可能用分号拼接多条 SELECT，asyncpg 不支持多命令 → 直接拒绝
+    ok, msg = validate_sql(
+        "SELECT * FROM alm_issues WHERE model_code='EV160'; "
+        "SELECT COUNT(*) FROM alm_issues WHERE model_code='EV160'"
+    )
+    assert not ok
+    assert "单条" in msg
+
+
+def test_with_cte_allowed():
+    # WITH ... SELECT 是合法的单条只读查询，sqlglot 中 WITH 挂在 Select 节点上
+    ok, sql = validate_sql(
+        "WITH recent AS (SELECT COUNT(*) AS c FROM alm_issues WHERE model_code='EV160') "
+        "SELECT * FROM recent"
+    )
+    assert ok
+    assert "LIMIT 100" in sql
+
+
 def test_trailing_comment_stripped():
     ok, sql = validate_sql("SELECT * FROM alm_issues -- 备注")
     assert ok
