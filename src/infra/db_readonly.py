@@ -3,7 +3,7 @@
 #
 # 连共享 PG 的 rd_agent 库（项目一的业务库）。
 # 开发期用同一用户，生产环境换成只读用户 + default_transaction_read_only=on。
-# ★ NullPool 解决 Gradio event loop 不兼容问题
+# ★ NullPool：不跨事件循环复用连接，避免绑定问题
 # ============================================================
 
 from collections.abc import AsyncGenerator

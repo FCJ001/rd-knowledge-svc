@@ -17,7 +17,7 @@ settings = get_settings()
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.APP_DEBUG,
-    poolclass=NullPool,  # ★ Gradio event loop 不兼容连接池
+    poolclass=NullPool,  # ★ 不跨事件循环复用连接，避免 asyncpg 绑定问题
     pool_pre_ping=True,
 )
 
