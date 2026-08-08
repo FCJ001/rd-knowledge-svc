@@ -5,6 +5,7 @@
 # ============================================================
 
 import io
+import json
 
 from minio import Minio
 from loguru import logger
@@ -33,6 +34,26 @@ def ensure_bucket_exists() -> None:
     if not exists:
         _minio_client.make_bucket(bucket_name=settings.MINIO_BUCKET)
         logger.info(f"创建 MinIO bucket: {settings.MINIO_BUCKET}")
+
+    # ★ 公共读策略：检索命中的图片 URL 是 http://endpoint/bucket/obj 的裸地址，
+    #   前端 <img> 需匿名 GET 才能直接显示。
+    #   开发期对本地 MinIO 的 knowledge-docs 桶开放只读；
+    #   生产应改为预签名 URL 或鉴权代理（见 risk）。
+    try:
+        _minio_client.set_bucket_policy(
+            settings.MINIO_BUCKET,
+            json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:GetObject"],
+                    "Resource": [f"arn:aws:s3:::{settings.MINIO_BUCKET}/*"],
+                }],
+            }),
+        )
+    except Exception as e:
+        logger.warning(f"设置 bucket 公共读策略失败（图片可能无法直接访问）: {e}")
 
 
 def upload_file(object_name: str, data: bytes,

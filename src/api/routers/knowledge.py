@@ -50,6 +50,7 @@ class SearchResponse(BaseModel):
     question: str
     answer: str
     channels: list[str]
+    image_urls: list[str] = Field(default=[], description="检索命中的图片 URL（可点击查看原图）")
 
 
 class FeedbackRequest(BaseModel):
@@ -85,6 +86,7 @@ async def search_knowledge(
     if cached:
         answer = cached["answer"]
         contexts = cached.get("contexts", [])
+        image_urls = cached.get("image_urls", [])
         logger.info(f"查询缓存命中: question={req.question[:20]}")
         # 缓存命中仍落审计（traceability），但跳过 LLM 调用/评估
         from src.knowledge.audit import QueryAuditLog
@@ -101,6 +103,7 @@ async def search_knowledge(
             question=req.question,
             answer=answer,
             channels=req.channels,
+            image_urls=image_urls,
         ))
 
     llm = get_llm()
@@ -129,10 +132,11 @@ async def search_knowledge(
         )
     answer = result["answer"] if isinstance(result, dict) else result
     contexts = result.get("contexts", []) if isinstance(result, dict) else []
+    image_urls = result.get("image_urls", []) if isinstance(result, dict) else []
 
     # ── 写入查询缓存（文档/图谱相对静态，缓存安全；无上下文时不缓存空壳答案）──
     if contexts:
-        await set_json_cache(cache_key, {"answer": answer, "contexts": contexts})
+        await set_json_cache(cache_key, {"answer": answer, "contexts": contexts, "image_urls": image_urls})
 
     # ── 查询审计日志（检索链路在 API 端点落审计）──
     QueryAuditLog.log(
@@ -166,6 +170,7 @@ async def search_knowledge(
         question=req.question,
         answer=answer,
         channels=req.channels,
+        image_urls=image_urls,
     ))
 
 

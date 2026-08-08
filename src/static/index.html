@@ -630,6 +630,7 @@ function renderSearchResult(question, data) {
         ${channels.map(c=>`<span class="channel-tag">${escHtml(c)}</span>`).join('')}
       </div>
       <div class="rc-body">${renderMarkdown(data.answer)}</div>
+      ${renderImages(data.image_urls)}
       <div class="rc-footer">
         <span style="font-size:12px;color:var(--muted);">回答对你有帮助吗？</span>
         <button class="feedback-btn" id="fbUp" onclick="submitFeedback(1)">👍 有用</button>
@@ -684,6 +685,7 @@ async function doSearchStream() {
     </div>
     <div class="channel-tags" style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;"></div>
     <div class="rc-body" style="white-space:pre-wrap;">⏳ 检索中…</div>
+    <div class="rc-images"></div>
     <div class="rc-footer" style="display:none;">
       <span style="font-size:12px;color:var(--muted);">回答对你有帮助吗？</span>
       <button class="feedback-btn" id="fbUp" onclick="submitFeedback(1)">👍 有用</button>
@@ -693,9 +695,11 @@ async function doSearchStream() {
   box.appendChild(card);
   const tagsEl = card.querySelector('.channel-tags');
   const answerEl = card.querySelector('.rc-body');
+  const imageEl = card.querySelector('.rc-images');
   const footerEl = card.querySelector('.rc-footer');
 
   let answerText = '';
+  let imageUrls = [];
   try {
     const resp = await fetch(BASE+'/api/v1/knowledge/search-stream',{
       method:'POST',
@@ -727,6 +731,7 @@ async function doSearchStream() {
             answerEl.scrollIntoView({behavior:'smooth', block:'nearest'});
           } else if (payload.type === 'done') {
             answerEl.innerHTML = renderMarkdown(answerText);
+            imageUrls = payload.image_urls || [];
           } else if (payload.type === 'error') {
             answerEl.innerHTML = `<div class="empty-state">⚠️ ${escHtml(payload.content||'未知错误')}</div>`;
           }
@@ -740,6 +745,7 @@ async function doSearchStream() {
     } else {
       footerEl.style.display = '';
     }
+    if (imageEl) imageEl.innerHTML = renderImages(imageUrls);
   } catch(e) {
     box.innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div>请求失败：${escHtml(e.message)}</div>`;
   }
@@ -1152,6 +1158,14 @@ async function pollProgress(docId) {
 /* ══════════════════════════════════════════════════════════════
    Markdown Renderer
    ══════════════════════════════════════════════════════════════ */
+function renderImages(urls) {
+  if (!urls || !urls.length) return '';
+  const imgs = urls.map(u =>
+    `<a href="${escHtml(u)}" target="_blank" rel="noopener"><img src="${escHtml(u)}" alt="检索命中图片" loading="lazy" style="max-width:240px;max-height:180px;border-radius:8px;object-fit:cover;box-shadow:0 1px 4px rgba(0,0,0,.15)"></a>`
+  ).join('');
+  return `<div style="margin-top:12px;"><div style="font-size:12px;color:var(--muted);margin-bottom:6px;">📷 检索命中图片（${urls.length}）</div><div style="display:flex;gap:8px;flex-wrap:wrap;">${imgs}</div></div>`;
+}
+
 function renderMarkdown(text) {
   if (!text) return '';
   return text

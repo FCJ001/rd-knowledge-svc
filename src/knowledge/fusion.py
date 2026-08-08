@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.config import get_settings
 from src.core.metrics import RETRIEVAL_REQUESTS
 from src.core.resilience import with_retry, get_channel_breaker
-from src.knowledge.doc_rag import format_doc_context, search_docs_raw
+from src.knowledge.doc_rag import extract_image_urls, format_doc_context, search_docs_raw
 from src.knowledge.graph_rag import search_graph_raw
 from src.knowledge.hallucination_check import check_hallucination
 from src.knowledge.prompts import FUSION_PROMPT
@@ -166,6 +166,7 @@ async def multi_channel_search(
     source_parts = []
     evidence_parts = []
     retrieved_chunks = []  # 收集所有检索 chunks，供评测使用
+    image_urls = []        # 文档检索命中的图片 URL，供响应层展示
 
     if doc_hits:
         ctx = format_doc_context(doc_hits)
@@ -176,6 +177,7 @@ async def multi_channel_search(
             text = hit.get("parent_text") or hit.get("text", "")
             if text:
                 retrieved_chunks.append(text[:500])
+        image_urls = extract_image_urls(doc_hits)
 
     graph_records = results.get("graph_rag")
     if graph_records:
@@ -191,13 +193,13 @@ async def multi_channel_search(
 
     if not source_parts:
         answer = "所有检索通道均未找到与您问题相关的信息。"
-        _emit(event_sink, {"type": "done", "answer": answer, "contexts": []})
-        return {"answer": answer, "contexts": []}
+        _emit(event_sink, {"type": "done", "answer": answer, "contexts": [], "image_urls": []})
+        return {"answer": answer, "contexts": [], "image_urls": []}
 
     sources = "\n\n".join(source_parts)
     prompt = FUSION_PROMPT.format(question=question, sources=sources, role=role)
     answer = await _generate_answer(llm, prompt, event_sink)
-    _emit(event_sink, {"type": "done", "answer": answer, "contexts": retrieved_chunks})
+    _emit(event_sink, {"type": "done", "answer": answer, "contexts": retrieved_chunks, "image_urls": image_urls})
 
     evidence = "\n".join(evidence_parts)
     hal_result = await check_hallucination(question, evidence, answer, llm)
@@ -208,4 +210,5 @@ async def multi_channel_search(
     return {
         "answer": answer,
         "contexts": retrieved_chunks,
+        "image_urls": image_urls,
     }
