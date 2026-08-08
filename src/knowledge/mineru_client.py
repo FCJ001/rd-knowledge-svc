@@ -31,12 +31,16 @@ async def parse_document(
     file_name: str | None = None,
     backend: str | None = None,
     return_images: bool = True,
+    formula_enable: bool = True,
 ) -> tuple[str, list[int], dict[str, bytes]]:
     """
     调用 MinerU API 解析文档。
     优先使用异步接口（POST /tasks -> 轮询），超大文件不会阻塞。
     Returns: (markdown_text, page_numbers_per_block, images_dict)
         images_dict: key=文件名, value=图片 bytes
+
+    formula_enable: True=公式输出 LaTeX 文本（可检索/可引用）；
+        False=公式输出为原图（保真对照用），用于双通道取公式原图。
     """
     base_url = settings.MINERU_API_URL
     backend = backend or settings.MINERU_BACKEND
@@ -55,7 +59,7 @@ async def parse_document(
                 "backend": backend,
                 "return_md": "true",
                 "return_images": str(return_images).lower(),
-                "formula_enable": "true",
+                "formula_enable": str(formula_enable).lower(),
                 "table_enable": "true",
             },
         )
@@ -65,7 +69,7 @@ async def parse_document(
 
         if not task_id:
             logger.warning("MinerU 未返回 task_id，尝试同步解析")
-            return await _parse_sync(file_path, file_name, backend, return_images)
+            return await _parse_sync(file_path, file_name, backend, return_images, formula_enable)
 
         for _ in range(timeout // 2):
             await asyncio.sleep(2)
@@ -88,6 +92,7 @@ async def parse_document(
 
 async def _parse_sync(
     file_path: str, file_name: str, backend: str, return_images: bool = True,
+    formula_enable: bool = True,
 ) -> tuple[str, list[int], dict[str, bytes]]:
     """同步解析（兜底方案）"""
     base_url = settings.MINERU_API_URL
@@ -101,7 +106,7 @@ async def _parse_sync(
                 "backend": backend,
                 "return_md": "true",
                 "return_images": str(return_images).lower(),
-                "formula_enable": "true",
+                "formula_enable": str(formula_enable).lower(),
                 "table_enable": "true",
             },
         )

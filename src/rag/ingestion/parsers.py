@@ -17,19 +17,24 @@ class DocumentParser:
     def __init__(self, parser: str = "mineru"):
         self.parser = parser
 
-    async def parse(self, file_path: str) -> tuple[str, list[int], dict[str, bytes]]:
+    async def parse(
+        self, file_path: str, formula_enable: bool = True,
+    ) -> tuple[str, list[int], dict[str, bytes]]:
         """
         Returns: (markdown_content, page_numbers_per_chunk, images_dict)
             images_dict: key=文件名, value=图片 bytes
 
         MinerU 优先（高精度表格识别），失败降级到 LlamaIndex。
         ★ MinerU 返回的 page_number 取真实值，不是硬编码 0。
+        formula_enable: False 时公式输出为原图（供公式原图对照通道）。
         """
         file_name = Path(file_path).name
 
         if self.parser == "mineru":
             try:
-                md_text, pages, images = await parse_document(file_path, file_name)
+                md_text, pages, images = await parse_document(
+                    file_path, file_name, formula_enable=formula_enable,
+                )
                 if md_text and len(md_text.strip()) > 10:
                     logger.info(
                         f"MinerU 解析成功: {file_name} ({len(md_text)} chars, "

@@ -151,6 +151,14 @@ class IngestionPipeline:
             logger.error(f"文档解析后无内容: {meta.doc_name}")
             return doc_id
 
+        # ★ 公式原图对照（双通道）：额外 formula_enable=false 解析取公式原图，
+        #   VL 读出公式内容后嵌入 markdown，防 LaTeX 识别不准确
+        if settings.FORMULA_IMAGE_ENABLED:
+            formula_images = await self._collect_formula_images(file_path, images)
+            md_text = await self._embed_formula_images(
+                md_text, formula_images, doc_id, meta.doc_name,
+            )
+
         # ★ 上传图片到 MinIO，替换 markdown 引用为 MinIO URL
         if images:
             md_text = await self._upload_images_and_replace_refs(
@@ -221,6 +229,133 @@ class IngestionPipeline:
             logger.info(f"入库完成: {meta.doc_name} doc_id={doc_id} chunks={len(all_data)}")
 
         return doc_id
+
+    async def _collect_formula_images(
+        self, file_path: str, natural_images: dict[str, bytes],
+    ) -> list[tuple[str, bytes]]:
+        """第二遍解析（formula_enable=false）取公式原图。
+
+        MinerU formula_enable=false 时公式输出为原图，自然图两遍都会出现。
+        公式图 = 第二遍 images 中内容哈希不在第一遍（自然图）集合里的图，
+        并按第二遍 markdown 引用顺序排序，保证与公式位置一一对应。
+        fail-open：第二遍解析失败返回空列表，不影响主通道入库。"""
+        try:
+            md2, _pages2, images2 = await self.parser.parse(
+                file_path, formula_enable=False,
+            )
+        except Exception as e:
+            logger.warning(f"公式原图通道解析失败（跳过）: {e}")
+            return []
+
+        if not images2:
+            return []
+
+        natural_hashes = {
+            hashlib.sha256(b).hexdigest() for b in natural_images.values()
+        }
+        ordered: list[tuple[str, bytes]] = []
+        seen: set[str] = set()
+        for ref in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", md2):
+            key = ref
+            img_bytes = images2.get(key)
+            if img_bytes is None and key.startswith("images/"):
+                img_bytes = images2.get(key[len("images/"):])
+            if img_bytes is None:
+                continue
+            digest = hashlib.sha256(img_bytes).hexdigest()
+            if digest in natural_hashes:
+                continue  # 自然图（两遍都出现），非公式
+            if digest in seen:
+                continue
+            seen.add(digest)
+            ordered.append((key, img_bytes))
+        return ordered
+
+    async def _embed_formula_images(
+        self, md_text: str, formula_images: list[tuple[str, bytes]],
+        doc_id: str, doc_name: str,
+    ) -> str:
+        """公式原图上传 MinIO + VL 读出公式内容，紧贴对应 $$..$$ 公式下方。
+
+        对齐规则：两遍解析均保持文档顺序，公式 token（行内 $..$ + 行间 $$..$$）
+        与公式原图一一对应；仅行间公式嵌入原图。
+        数量不匹配时（行内公式导致错位）退化为文末『公式原图对照』附录，保证原图不丢。
+        fail-open：上传/VL 失败只跳过单张，不阻塞入库。"""
+        if not formula_images:
+            return md_text
+
+        # 1) 上传 MinIO + VL 读出公式内容
+        refs: list[str] = []
+        for img_key, img_bytes in formula_images:
+            base_name = img_key.rsplit("/", 1)[-1] or "formula.png"
+            ext = base_name.rsplit(".", 1)[-1].lower() if "." in base_name else "png"
+            content_type = {
+                "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+            }.get(ext, "image/png")
+            object_name = f"images/{doc_id}/formula/{base_name}"
+            try:
+                upload_file(object_name, img_bytes, content_type=content_type)
+            except Exception as e:
+                logger.error(f"公式原图上传 MinIO 失败 {object_name}: {e}")
+                continue
+
+            scheme = "https" if settings.MINIO_SECURE else "http"
+            minio_url = f"{scheme}://{settings.MINIO_ENDPOINT}/{settings.MINIO_BUCKET}/{object_name}"
+
+            summary = ""
+            if settings.IMAGE_SUMMARIZE_ENABLED:
+                from src.rag.ingestion.image_summarizer import (
+                    FORMULA_PROMPT,
+                    summarize_image,
+                )
+                summary = await summarize_image(
+                    img_bytes, content_type, settings.VL_MODEL, prompt=FORMULA_PROMPT,
+                )
+            alt = f"公式原图：{summary}" if summary else "公式原图"
+            refs.append(f"![{alt}]({minio_url})")
+
+        if not refs:
+            return md_text
+
+        # 2) 公式 token 序列（行内 + 行间）与公式原图按文档顺序对齐
+        formula_pattern = re.compile(r"\$\$[\s\S]+?\$\$|\$[^$\n]+?\$")
+        formula_types = [
+            tok.startswith("$$") for tok in formula_pattern.findall(md_text)
+        ]
+
+        if len(formula_types) == len(refs):
+            # 逐公式嵌入：仅行间公式（$$..$$）后紧跟原图
+            parts: list[str] = []
+            last = 0
+            for m in formula_pattern.finditer(md_text):
+                parts.append(md_text[last:m.start()])
+                parts.append(m.group(0))  # 公式 token 单独成段
+                last = m.end()
+            parts.append(md_text[last:])
+
+            out: list[str] = []
+            fi = 0  # 全局公式序号（含行内），refs 与之按文档顺序一一对应
+            for idx, part in enumerate(parts):
+                out.append(part)
+                # 奇数索引 = 公式 token；仅行间公式（$$）在其后嵌入对应原图
+                if idx % 2 == 1:
+                    if part.startswith("$$") and fi < len(refs):
+                        out.append(f"\n\n{refs[fi]}\n")
+                    fi += 1
+            md_text = "".join(out)
+            logger.info(
+                f"公式原图嵌入完成 {len(refs)} 张（逐公式对照）: {doc_name}"
+            )
+        else:
+            # 数量不匹配 → 文末附录，原图不丢
+            appendix = "\n\n## 公式原图（识别对照）\n" + "\n\n".join(refs)
+            md_text = md_text + appendix
+            logger.info(
+                f"公式原图 {len(refs)} 张与公式数 {len(formula_types)} 不匹配，"
+                f"转文末附录: {doc_name}"
+            )
+        return md_text
 
     async def _upload_images_and_replace_refs(
         self, md_text: str, images: dict[str, bytes], doc_id: str, doc_name: str,

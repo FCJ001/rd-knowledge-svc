@@ -74,6 +74,12 @@ class Settings(BaseSettings):
     VL_MODEL: str = "qwen-vl-max"
     IMAGE_SUMMARIZE_ENABLED: bool = True  # 入库时对每张图片调用 VL 生成描述写入 markdown
 
+    # ---------------- 公式原图对照（双通道）----------------
+    # MinerU formula_enable 是二选一：True=LaTeX 文本（可检索），False=公式原图（保真）。
+    # 开启后入库时额外跑一遍 formula_enable=false，取公式原图嵌入 markdown 供人眼对照，
+    # 防 LaTeX OCR 识别不准确。代价：解析时间约 2 倍（异步 worker 可接受）。
+    FORMULA_IMAGE_ENABLED: bool = True
+
     # ---------------- API 限流 ----------------
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_BACKEND: str = "redis"     # redis（ZSET 跨 worker）/ memory（进程内 deque）

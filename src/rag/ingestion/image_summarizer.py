@@ -19,17 +19,25 @@ SUMMARY_PROMPT = (
     "仅输出描述本身，不要多余解释。"
 )
 
+FORMULA_PROMPT = (
+    "这是一张公式原图（识别对照用）。请仔细辨认图片中的公式，"
+    "用 LaTeX 语法把公式完整读出（如 R = \\frac{U_{max}}{I}）。"
+    "若 LaTeX 无法表示，用中文文字说明公式含义。仅输出公式本身，不要多余解释。"
+)
+
 
 async def summarize_image(
     img_bytes: bytes,
     mime_type: str,
     model: str | None = None,
     context: str = "",
+    prompt: str | None = None,
 ) -> str:
     """调用 VL 模型生成图片摘要；失败返回空串（fail-open）。
 
     context: 图片在文档中出现的上下文（如所在段落），可辅助模型理解图片
-    主题，使描述带上车型/部件名等可检索的专业词。"""
+    主题，使描述带上车型/部件名等可检索的专业词。
+    prompt: 自定义读取提示词（如公式原图用 FORMULA_PROMPT 读公式内容）。"""
     try:
         import dashscope
         from dashscope import MultiModalConversation
@@ -37,7 +45,7 @@ async def summarize_image(
         dashscope.api_key = settings.DASHSCOPE_API_KEY
         model = model or settings.VL_MODEL
 
-        prompt = SUMMARY_PROMPT
+        prompt = prompt or SUMMARY_PROMPT
         if context:
             prompt += f"\n\n该图片在文档中出现的上下文（辅助理解，请结合图片内容）：\n{context}"
 
