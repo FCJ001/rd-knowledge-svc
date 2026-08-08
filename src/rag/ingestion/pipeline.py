@@ -251,10 +251,14 @@ class IngestionPipeline:
             minio_url = f"{scheme}://{settings.MINIO_ENDPOINT}/{settings.MINIO_BUCKET}/{object_name}"
 
             # ★ VL 摘要：描述写入 alt，检索可命中图片内容（fail-open：失败则 alt 为空）
+            #   附带图片所在段落上下文，让描述带上车型/部件名等可检索专业词
             summary = ""
             if settings.IMAGE_SUMMARIZE_ENABLED:
                 from src.rag.ingestion.image_summarizer import summarize_image
-                summary = await summarize_image(img_bytes, content_type, settings.VL_MODEL)
+                context = self._extract_image_context(md_text, f"images/{img_name}")
+                summary = await summarize_image(
+                    img_bytes, content_type, settings.VL_MODEL, context=context,
+                )
             alt = f"[{summary}]" if summary else "[]"
 
             # 替换 markdown 中的图片引用：![]() → ![summary](minio_url)
@@ -264,6 +268,29 @@ class IngestionPipeline:
 
         logger.info(f"图片上传 MinIO 完成: {doc_name} ({len(images)} 张)")
         return md_text
+
+    @staticmethod
+    def _extract_image_context(md_text: str, img_ref: str, window: int = 200) -> str:
+        """取图片引用前的一段 markdown 作为 VL 摘要的辅助上下文。
+
+        窗口 window 字符内，向前截到距离图片最近的分隔点：优先上一个空行（段落边界），
+        其次上一个图片引用的右括号之后——避免把邻居图的引用字符串混进上下文。"""
+        idx = md_text.find(f"![]({img_ref})")
+        if idx == -1:
+            return ""
+        prefix = md_text[max(0, idx - window):idx]
+
+        candidates: list[int] = []
+        blank = prefix.rfind("\n\n")
+        if blank >= 0:
+            candidates.append(blank + 2)  # 空行之后
+        prev_img = prefix.rfind("![](")
+        if prev_img >= 0:
+            close = prefix.find(")", prev_img)
+            candidates.append(close + 1 if close >= 0 else prev_img)  # 上一个图片引用之后
+        if candidates:
+            prefix = prefix[max(candidates):]
+        return prefix.strip()
 
     @staticmethod
     def _extract_image_urls(text: str) -> list[str]:

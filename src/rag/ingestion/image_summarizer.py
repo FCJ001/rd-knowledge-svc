@@ -24,8 +24,12 @@ async def summarize_image(
     img_bytes: bytes,
     mime_type: str,
     model: str | None = None,
+    context: str = "",
 ) -> str:
-    """调用 VL 模型生成图片摘要；失败返回空串（fail-open）。"""
+    """调用 VL 模型生成图片摘要；失败返回空串（fail-open）。
+
+    context: 图片在文档中出现的上下文（如所在段落），可辅助模型理解图片
+    主题，使描述带上车型/部件名等可检索的专业词。"""
     try:
         import dashscope
         from dashscope import MultiModalConversation
@@ -33,11 +37,15 @@ async def summarize_image(
         dashscope.api_key = settings.DASHSCOPE_API_KEY
         model = model or settings.VL_MODEL
 
+        prompt = SUMMARY_PROMPT
+        if context:
+            prompt += f"\n\n该图片在文档中出现的上下文（辅助理解，请结合图片内容）：\n{context}"
+
         b64 = base64.b64encode(img_bytes).decode()
         image = f"data:{mime_type};base64,{b64}"
         messages = [{
             "role": "user",
-            "content": [{"image": image}, {"text": SUMMARY_PROMPT}],
+            "content": [{"image": image}, {"text": prompt}],
         }]
 
         # MultiModalConversation.call 是同步调用，用 to_thread 避免阻塞事件循环
