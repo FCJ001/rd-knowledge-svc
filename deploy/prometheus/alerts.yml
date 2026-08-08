@@ -1,0 +1,114 @@
+# ============================================================
+# rd-knowledge-svc 业务告警规则（Prometheus Alertmanager 消费）
+#
+# 指标来源：src/core/metrics.py 暴露的 http_requests_total /
+# http_request_duration_seconds / llm_tokens_total / retrieval_requests_total /
+# rate_limit_rejected_total / circuit_breaker_state_changes_total / ingestion_jobs_total
+#
+# 使用：把本文件挂载到 Prometheus rules 目录即可。
+#   prometheus.yml:
+#     rule_files:
+#       - "/etc/prometheus/alerts.yml"
+# ============================================================
+
+groups:
+  - name: rd-knowledge-svc-core
+    rules:
+      # ── 核心链路可用性 ─────────────────────────────────────────
+      # 5xx 比例连续 5 分钟超过 5%（样本数 >= 50 才判定，避免小流量误报）
+      - alert: KnowledgeSvcHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(http_requests_total[5m])), 1e-6)
+          > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: rd-knowledge-svc
+        annotations:
+          summary: "知识检索服务 5xx 错误率过高"
+          description: "5xx 占比 {{ $value | humanizePercentage }}（持续 5 分钟），核心链路异常。"
+
+      # ── 延迟 ─────────────────────────────────────────────────
+      - alert: KnowledgeSvcHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "知识检索服务 p95 延迟过高"
+          description: "p95 延迟 {{ $value }}s（持续 10 分钟），可能 LLM 或下游通道变慢。"
+
+      # ── 检索通道失败 ─────────────────────────────────────────
+      # 任一通道失败率（失败+跳过 占 全部调用）持续 10 分钟超 30%
+      - alert: KnowledgeSvcRetrievalDegraded
+        expr: |
+          sum(rate(retrieval_requests_total{status=~"failed|skipped"}[10m])) by (channel)
+            / clamp_min(sum(rate(retrieval_requests_total[10m])) by (channel), 1e-6)
+          > 0.3
+        for: 10m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "检索通道 {{ $labels.channel }} 降级"
+          description: "通道 {{ $labels.channel }} 失败/空返回占比 {{ $value | humanizePercentage }}，建议检查 Milvus/Neo4j/只读库。"
+
+      # ── 限流过载 ─────────────────────────────────────────────
+      # 429 速率持续 10 分钟超 5 req/s → 用户被限流过多，需扩容或调参
+      - alert: KnowledgeSvcRateLimitStorm
+        expr: |
+          sum(rate(rate_limit_rejected_total[10m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "大量请求被限流"
+          description: "限流拒绝速率 {{ $value }} req/s，可能是异常流量或限流阈值过严。"
+
+      # ── 熔断 ─────────────────────────────────────────────────
+      # 任一熔断器停留在 open 状态超 2 分钟 → 下游不可用
+      - alert: KnowledgeSvcCircuitOpen
+        expr: |
+          # 用"进入 open 的累计次数增量"近似判断：最近 2 分钟有 open 切换则告警
+          increase(circuit_breaker_state_changes_total{state="open"}[2m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: rd-knowledge-svc
+        annotations:
+          summary: "熔断器 {{ $labels.target }} 已打开"
+          description: "目标 {{ $labels.target }} 熔断打开，依赖不可用，请求将被快速失败。"
+
+      # ── 入库任务 ─────────────────────────────────────────────
+      # 入库失败数持续 10 分钟超 3 个
+      - alert: KnowledgeSvcIngestFailures
+        expr: |
+          increase(ingestion_jobs_total{status="failed"}[10m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "文档入库任务大量失败"
+          description: "最近 10 分钟入库失败 {{ $value }} 次，检查 MinerU 解析 / embedding / Milvus 写入。"
+
+  # ── LLM 成本水位 ───────────────────────────────────────────
+  - name: rd-knowledge-svc-cost
+    rules:
+      # 单实例 5 分钟输出 token 速率超过 10k/min 提示成本告警
+      - alert: KnowledgeSvcTokenSpike
+        expr: |
+          sum(rate(llm_tokens_total{kind="output"}[5m])) > 10000
+        for: 10m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "LLM 输出 token 速率激增"
+          description: "输出 token 速率 {{ $value }} /s，注意成本；可检查是否有异常重试或死循环。"

@@ -11,18 +11,20 @@ import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.base_schema import ResponseSchema
 from src.core.deps import UserContext, get_current_user
-from src.core.exceptions import ERR_INGEST_FAILED, BizException
 from src.core.logger import logger
+from src.core.metrics import INGESTION_JOBS
 from src.core.rate_limit import check_rate_limit
 from src.infra.db import get_db
-from src.knowledge.doc_ingestion import delete_doc as delete_doc_service
-from src.knowledge.doc_ingestion import ingest_and_index
+from src.knowledge.doc_ingestion import (
+    create_ingest_record,
+    delete_doc as delete_doc_service,
+)
 from src.knowledge.model import DocIngestJob, KnowledgeDoc
 
 router = APIRouter(prefix="/api/v1/ingest", tags=["文档入库"])
@@ -59,7 +61,7 @@ async def upload_doc(
     user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """上传文档并触发入库管线（解析→切片→嵌入→索引）"""
+    """上传文档并投递异步入库任务（worker 进程处理解析/切片/嵌入/索引）"""
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名为空")
 
@@ -71,20 +73,17 @@ async def upload_doc(
         tmp_path = tmp.name
 
     try:
-        # 上传到 MinIO
-        minio_key = None
-        try:
-            from src.core.config import get_settings
-            from src.infra.minio_client import get_minio_client
-            minio_client = get_minio_client()
-            minio_key = f"{doc_type}/{model_code or 'common'}/{file.filename}"
-            minio_client.fput_object(get_settings().MINIO_BUCKET, minio_key, tmp_path)
-            logger.info(f"MinIO 上传完成: {minio_key}")
-        except Exception as e:
-            logger.warning(f"MinIO 上传失败（继续入库）: {e}")
+        # 1. 上传到 MinIO（原始文档留存，worker 从中取）
+        from src.core.config import get_settings
+        from src.infra.minio_client import get_minio_client
+        minio_client = get_minio_client()
+        minio_key = f"{doc_type}/{model_code or 'common'}/{file.filename}"
+        minio_client.fput_object(get_settings().MINIO_BUCKET, minio_key, tmp_path)
+        logger.info(f"MinIO 上传完成: {minio_key}")
 
-        doc_id = await ingest_and_index(
-            file_path=tmp_path,
+        # 2. 落 queued 记录（幂等 upsert KnowledgeDoc + DocIngestJob）
+        doc_id, job_id = await create_ingest_record(
+            db,
             doc_name=file.filename,
             doc_type=doc_type,
             category=category,
@@ -92,28 +91,43 @@ async def upload_doc(
             model_code=model_code,
             chunk_strategy=chunk_strategy,
             parser=parser,
-            db=db,
         )
+        result = await db.execute(select(KnowledgeDoc).where(KnowledgeDoc.doc_id == doc_id))
+        doc = result.scalar_one_or_none()
+        if doc:
+            doc.minio_key = minio_key
 
-        # 更新 MinIO key
-        if minio_key:
-            result = await db.execute(
-                select(KnowledgeDoc).where(KnowledgeDoc.doc_id == doc_id)
-            )
-            doc = result.scalar_one_or_none()
-            if doc:
-                doc.minio_key = minio_key
+        # 3. 投递 Redis Stream（worker 消费）
+        from src.rag.ingestion.queue import enqueue_ingest_job
+        ok = await enqueue_ingest_job({
+            "job_id": job_id,
+            "doc_id": doc_id,
+            "object_name": minio_key,
+            "doc_name": file.filename,
+            "doc_type": doc_type,
+            "category": category,
+            "business_line": business_line,
+            "model_code": model_code,
+            "chunk_strategy": chunk_strategy,
+            "parser": parser,
+        })
+        if not ok:
+            await db.rollback()
+            raise HTTPException(status_code=503, detail="入库队列暂不可用，请稍后重试")
 
         await db.commit()
+        INGESTION_JOBS.labels(status="queued").inc()
         return ResponseSchema(data=IngestResponse(
             doc_id=doc_id,
             doc_name=file.filename,
-            status="indexed",
+            status="queued",
         ))
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception(f"文档入库失败: {file.filename}")
-        raise HTTPException(status_code=500, detail=f"入库失败: {e}")
+        logger.exception(f"文档上传失败: {file.filename}")
+        raise HTTPException(status_code=500, detail=f"上传失败: {e}")
 
     finally:
         try:

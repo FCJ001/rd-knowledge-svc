@@ -76,8 +76,25 @@ class Settings(BaseSettings):
 
     # ---------------- API 限流 ----------------
     RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_BACKEND: str = "redis"     # redis（ZSET 跨 worker）/ memory（进程内 deque）
     RATE_LIMIT_MAX_REQUESTS: int = 20     # 每个 user_id 每个滑动窗口内最多请求数
     RATE_LIMIT_WINDOW_SECONDS: int = 60   # 滑动窗口时长（秒）
+
+    # ---------------- 查询缓存 ----------------
+    QUERY_CACHE_ENABLED: bool = True       # 知识检索结果缓存（文档/图谱相对静态，安全）
+    QUERY_CACHE_TTL: int = 300             # 缓存有效期（秒）
+
+    # ---------------- 入库异步任务（Redis Stream + worker）----------------
+    INGEST_STREAM: str = "alm_ingest:jobs"        # 入库任务 Stream
+    INGEST_CONSUMER_GROUP: str = "alm_ingest_workers"  # 消费者组
+    INGEST_STREAM_MAX_LEN: int = 1000             # Stream 最大保留消息数
+    INGEST_MAX_RETRIES: int = 2                   # worker 处理失败重试次数
+
+    # ---------------- 韧性（超时/重试/熔断）----------------
+    RETRIEVAL_CHANNEL_TIMEOUT: int = 20   # 单检索通道超时（秒），超时按失败降级
+    RETRIEVAL_CHANNEL_RETRIES: int = 2    # 通道临时失败重试次数（指数退避）
+    CIRCUIT_FAILURE_THRESHOLD: int = 5    # 熔断阈值：连续失败 N 次打开熔断器
+    CIRCUIT_RESET_TIMEOUT: int = 30       # 熔断复位窗口（秒），过后放一个探针
 
     # ---------------- NL2SQL（查项目一业务库 rd_agent）----------------
     ALM_DB_USER: str = "rdagent"

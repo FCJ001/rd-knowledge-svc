@@ -10,12 +10,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from src.core.base_schema import ResponseSchema
 from src.core.config import get_settings
 from src.core.exceptions import register_exception_handlers
 from src.core.logger import logger, setup_logger
+from src.core.metrics import PrometheusMiddleware
 from src.middlewares.logging import TraceLoggingMiddleware
 
 settings = get_settings()
@@ -36,6 +38,7 @@ app = FastAPI(
 )
 
 app.add_middleware(TraceLoggingMiddleware)
+app.add_middleware(PrometheusMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -63,6 +66,12 @@ app.include_router(feedback_router)
 @app.get("/health", response_model=ResponseSchema[dict])
 async def health():
     return ResponseSchema(data={"app": settings.APP_NAME, "env": settings.APP_ENV})
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    """Prometheus 指标暴露端点（默认 /metrics 文本格式）"""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # ── 静态文件 & SPA ───────────────────────────────────────────────────────

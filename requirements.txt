@@ -40,6 +40,9 @@ pymilvus==2.6.10
 # ---------------- Redis ----------------
 redis==7.3.0
 
+# ---------------- 可观测性 ----------------
+prometheus-client==0.25.0
+
 # ---------------- LangChain / LangGraph ----------------
 langchain==1.2.15
 langchain-core==1.2.28

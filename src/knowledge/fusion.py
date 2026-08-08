@@ -17,15 +17,44 @@ from neo4j import AsyncDriver
 from pymilvus import MilvusClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import get_settings
+from src.core.metrics import RETRIEVAL_REQUESTS
+from src.core.resilience import with_retry, get_channel_breaker
 from src.knowledge.doc_rag import format_doc_context, search_docs_raw
 from src.knowledge.graph_rag import search_graph_raw
 from src.knowledge.hallucination_check import check_hallucination
 from src.knowledge.prompts import FUSION_PROMPT
 
+_settings = get_settings()
+
 
 def _emit(event_sink: Callable[[dict], None] | None, msg: dict) -> None:
     if event_sink is not None:
         event_sink(msg)
+
+
+async def _run_channel(key: str, factory: Callable[[], object]) -> object:
+    """单个检索通道：熔断 → 重试（退避）→ 超时，三层保护。
+
+    - 熔断器 open 时直接抛错（快速失败），不再发起调用；
+    - 临时失败按 RETRIEVAL_CHANNEL_RETRIES 次指数退避重试；
+    - 单次执行受 RETRIEVAL_CHANNEL_TIMEOUT 限制，超时按失败降级。
+    """
+    breaker = get_channel_breaker(key)
+
+    # 顺序：熔断(外) → 退避重试(中) → 单次超时(内)
+    async def attempt() -> object:
+        return await asyncio.wait_for(factory(), timeout=_settings.RETRIEVAL_CHANNEL_TIMEOUT)
+
+    return await breaker.call(
+        lambda: with_retry(
+            attempt,
+            attempts=_settings.RETRIEVAL_CHANNEL_RETRIES,
+            base_delay=0.3,
+            retry_on=(Exception, asyncio.TimeoutError),
+            task=f"channel:{key}",
+        )
+    )
 
 
 async def _generate_answer(
@@ -73,24 +102,28 @@ async def multi_channel_search(
     if channels is None:
         channels = ["doc_rag", "graph_rag"]
 
-    tasks = {}
+    # 通道用"工厂函数"而非协程：失败重试时可以重新执行
+    tasks: dict[str, Callable[[], object]] = {}
     if "doc_rag" in channels:
-        tasks["doc_rag"] = search_docs_raw(
+        tasks["doc_rag"] = lambda: search_docs_raw(
             question, embedding_model, milvus_client,
             llm=llm, use_hyde=use_hyde,
         )
     if "graph_rag" in channels:
-        tasks["graph_rag"] = search_graph_raw(question, neo4j_driver, llm)
+        tasks["graph_rag"] = lambda: search_graph_raw(question, neo4j_driver, llm)
     if "nl2sql" in channels and db_session:
         from src.nl2sql.engine import search_sql
-        tasks["nl2sql"] = search_sql(question, llm, db_session)
+        tasks["nl2sql"] = lambda: search_sql(question, llm, db_session)
 
     logger.info(f"多通道检索开始: channels={list(tasks.keys())}")
 
     # asyncio.wait(FIRST_COMPLETED)：每完成一个通道立即推进度事件，
     # 比 gather 一次性返回更贴近流式体验
     results = {}
-    pending = {asyncio.create_task(coro, name=key) for key, coro in tasks.items()}
+    pending = {
+        asyncio.create_task(_run_channel(key, factory), name=key)
+        for key, factory in tasks.items()
+    }
     while pending:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -100,6 +133,7 @@ async def multi_channel_search(
             except Exception as e:
                 logger.warning(f"通道 {key} 检索失败: {e}")
                 results[key] = None
+                RETRIEVAL_REQUESTS.labels(channel=key, status="failed").inc()
                 _emit(event_sink, {"type": "progress", "channel": key, "status": "failed", "count": 0})
                 continue
             results[key] = result
@@ -109,6 +143,7 @@ async def multi_channel_search(
                 count, status = 1, "ok"
             else:
                 count, status = 0, "skipped"
+            RETRIEVAL_REQUESTS.labels(channel=key, status=status).inc()
             _emit(event_sink, {"type": "progress", "channel": key, "status": status, "count": count})
 
     # ── 汇总命中情况 ──

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_llm, get_embedding_model
 from src.core.base_schema import PageResult, ResponseSchema
+from src.core.cache import build_search_cache_key, get_json_cache, set_json_cache
 from src.core.deps import PageParams, UserContext, get_current_user
 from src.core.exceptions import ERR_BAD_REQUEST, ERR_NOT_FOUND, BizException
 from src.core.logger import logger
@@ -69,7 +70,37 @@ async def search_knowledge(
     user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """多通道知识检索：文档 + 图谱 + NL2SQL 并行查询"""
+    """多通道知识检索：文档 + 图谱 + NL2SQL 并行查询（命中查询缓存则直接返回）"""
+    cache_key = build_search_cache_key(
+        question=req.question,
+        channels=req.channels,
+        doc_type=req.doc_type,
+        model_code=req.model_code,
+        use_hyde=req.use_hyde,
+        role=user.role,
+    )
+    cached = await get_json_cache(cache_key)
+    if cached:
+        answer = cached["answer"]
+        contexts = cached.get("contexts", [])
+        logger.info(f"查询缓存命中: question={req.question[:20]}")
+        # 缓存命中仍落审计（traceability），但跳过 LLM 调用/评估
+        from src.knowledge.audit import QueryAuditLog
+        QueryAuditLog.log(
+            user_id=user.user_id,
+            role=user.role,
+            question=req.question,
+            intent="multi_channel:cache_hit",
+            channels=req.channels,
+            answer_preview=answer,
+            duration_ms=0,
+        )
+        return ResponseSchema(data=SearchResponse(
+            question=req.question,
+            answer=answer,
+            channels=req.channels,
+        ))
+
     llm = get_llm()
     embedding_model = get_embedding_model()
     milvus_client = get_milvus_client()
@@ -96,6 +127,10 @@ async def search_knowledge(
         )
     answer = result["answer"] if isinstance(result, dict) else result
     contexts = result.get("contexts", []) if isinstance(result, dict) else []
+
+    # ── 写入查询缓存（文档/图谱相对静态，缓存安全；无上下文时不缓存空壳答案）──
+    if contexts:
+        await set_json_cache(cache_key, {"answer": answer, "contexts": contexts})
 
     # ── 查询审计日志（检索链路在 API 端点落审计）──
     QueryAuditLog.log(
