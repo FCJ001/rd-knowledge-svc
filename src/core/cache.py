@@ -64,4 +64,5 @@ def build_search_cache_key(
 
     payload = f"{question}|{sorted(channels)}|{doc_type}|{model_code}|{use_hyde}|{role}"
     digest = hashlib.md5(payload.encode("utf-8")).hexdigest()
-    return f"alm_cache:search:{digest}"
+    # v2：image_urls 语义改为"答案引用的图片"，旧缓存全部失效
+    return f"alm_cache:search:v2:{digest}"

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Callable
 
 from langchain_core.embeddings import Embeddings
@@ -79,6 +80,34 @@ async def _generate_answer(
             answer_parts.append(content)
             event_sink({"type": "delta", "content": content})
     return "".join(answer_parts)
+
+
+def _sanitize_answer_images(answer: str, valid_urls: set[str]) -> str:
+    """只保留答案中真实存在于检索源里的图片引用。
+
+    LLM 可能编造图片 URL。逐条校验答案里的 ![描述](url)：
+    url 在检索命中的图片集合内才保留完整引用，否则去掉引用只剩描述文字，
+    避免展示 404 图片。"""
+    if not valid_urls:
+        return answer
+
+    def _repl(m: re.Match) -> str:
+        alt, url = m.group(1), m.group(2)
+        return m.group(0) if url in valid_urls else alt.strip()
+
+    return re.sub(r"!\[([^\]]*)\]\((https?://[^\s)]+)\)", _repl, answer)
+
+
+def _extract_md_image_urls(text: str) -> list[str]:
+    """从 markdown 文本中提取图片 URL（按出现顺序，去重）。
+
+    用于把"答案引用的图片"作为 image_urls 返回，保证图库与正文一一对应。"""
+    urls, seen = [], set()
+    for url in re.findall(r"!\[[^\]]*\]\((https?://[^\s)]+)\)", text):
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 async def multi_channel_search(
@@ -199,6 +228,10 @@ async def multi_channel_search(
     sources = "\n\n".join(source_parts)
     prompt = FUSION_PROMPT.format(question=question, sources=sources, role=role)
     answer = await _generate_answer(llm, prompt, event_sink)
+    # ★ 图片防伪：答案里的图片 URL 必须真实存在于检索源，防 LLM 编造
+    answer = _sanitize_answer_images(answer, set(image_urls))
+    # ★ 图库只返回答案真正引用的图片，与正文一一对应（不再返回全部命中图）
+    image_urls = _extract_md_image_urls(answer)
     _emit(event_sink, {"type": "done", "answer": answer, "contexts": retrieved_chunks, "image_urls": image_urls})
 
     evidence = "\n".join(evidence_parts)
