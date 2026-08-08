@@ -161,6 +161,7 @@ body {
 .result-card .rc-body table { border-collapse:collapse; margin:8px 0; width:100%; }
 .result-card .rc-body th,.result-card .rc-body td { border:1px solid var(--border); padding:6px 10px; font-size:13px; text-align:left; }
 .result-card .rc-body th { background:var(--bg); font-weight:600; }
+.result-card .rc-body img.rc-inline-img { max-width:100%; max-height:320px; margin:8px 0; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.15); }
 .result-card .rc-footer { display:flex; align-items:center; gap:12px; margin-top:16px; padding-top:12px; border-top:1px solid var(--border); }
 .feedback-btn {
   display:inline-flex; align-items:center; gap:4px; padding:5px 12px; border:1px solid var(--border);
@@ -328,7 +329,14 @@ body {
 
 /* ── Responsive ── */
 @media (max-width:768px) { .sidebar { display:none; } .page { padding:20px; } }
+/* 公式渲染：KaTeX 输出与正文基线对齐 */
+.katex { font-size: 1.05em; }
+.rc-body .katex-display { margin: 8px 0; overflow-x: auto; overflow-y: hidden; }
 </style>
+<!-- KaTeX 公式渲染（LaTeX $..$、\(..\)、$$..$$） -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
 </head>
 <body>
 
@@ -629,7 +637,7 @@ function renderSearchResult(question, data) {
         <div style="flex:1"></div>
         ${channels.map(c=>`<span class="channel-tag">${escHtml(c)}</span>`).join('')}
       </div>
-      <div class="rc-body">${renderMarkdown(data.answer)}</div>
+      <div class="rc-body" id="rcBody">${renderMarkdown(data.answer)}</div>
       ${renderImages(data.image_urls)}
       <div class="rc-footer">
         <span style="font-size:12px;color:var(--muted);">回答对你有帮助吗？</span>
@@ -637,6 +645,7 @@ function renderSearchResult(question, data) {
         <button class="feedback-btn" id="fbDown" onclick="submitFeedback(-1)">👎 无用</button>
       </div>
     </div>`;
+  katexRender(document.getElementById('rcBody'));
   document.getElementById('searchResults').scrollIntoView({behavior:'smooth'});
 }
 
@@ -731,6 +740,7 @@ async function doSearchStream() {
             answerEl.scrollIntoView({behavior:'smooth', block:'nearest'});
           } else if (payload.type === 'done') {
             answerEl.innerHTML = renderMarkdown(answerText);
+            katexRender(answerEl);  // 流式结束后统一渲染公式/表格
             imageUrls = payload.image_urls || [];
           } else if (payload.type === 'error') {
             answerEl.innerHTML = `<div class="empty-state">⚠️ ${escHtml(payload.content||'未知错误')}</div>`;
@@ -1163,13 +1173,32 @@ function renderImages(urls) {
   const imgs = urls.map(u =>
     `<a href="${escHtml(u)}" target="_blank" rel="noopener"><img src="${escHtml(u)}" alt="检索命中图片" loading="lazy" style="max-width:240px;max-height:180px;border-radius:8px;object-fit:cover;box-shadow:0 1px 4px rgba(0,0,0,.15)"></a>`
   ).join('');
-  return `<div style="margin-top:12px;"><div style="font-size:12px;color:var(--muted);margin-bottom:6px;">📷 检索命中图片（${urls.length}）</div><div style="display:flex;gap:8px;flex-wrap:wrap;">${imgs}</div></div>`;
+  return `<div style="margin-top:12px;"><div style="font-size:12px;color:var(--muted);margin-bottom:6px;">📷 文中图片（${urls.length}）</div><div style="display:flex;gap:8px;flex-wrap:wrap;">${imgs}</div></div>`;
+}
+
+function renderTableBlock(block) {
+  const lines = block.trim().split('\n').map(l => l.trim()).filter(l => l.startsWith('|'));
+  if (lines.length < 2) return block; // 单行不是表格
+  const cells = (line) => line.replace(/^\||\|$/g,'').split('|').map(s=>s.trim());
+  let bodyStart = 1;
+  // 第二行是分隔行（---: 等）则跳过
+  if (lines.length > 1 && /^[\s:|-]+$/.test(lines[1]) && lines[1].includes('-')) bodyStart = 2;
+  let h = '<table><thead><tr>';
+  cells(lines[0]).forEach(c => h += `<th>${c}</th>`);
+  h += '</tr></thead><tbody>';
+  for (let i = bodyStart; i < lines.length; i++) {
+    h += '<tr>' + cells(lines[i]).map(c => `<td>${c}</td>`).join('') + '</tr>';
+  }
+  return h + '</tbody></table>';
 }
 
 function renderMarkdown(text) {
   if (!text) return '';
   return text
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    // 内联图片：![alt](http://...) → <img>（alt/src 已转义，引号再单独转义防属性逃逸）
+    .replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (m, alt, url) =>
+      `<a href="${url.replace(/"/g,'&quot;')}" target="_blank" rel="noopener"><img class="rc-inline-img" loading="lazy" alt="${alt.replace(/"/g,'&quot;')}" src="${url.replace(/"/g,'&quot;')}"></a>`)
     .replace(/^### (.+)$/gm,'<h3>$1</h3>')
     .replace(/^## (.+)$/gm,'<h2>$1</h2>')
     .replace(/^# (.+)$/gm,'<h1>$1</h1>')
@@ -1177,9 +1206,24 @@ function renderMarkdown(text) {
     .replace(/`([^`]+)`/g,'<code>$1</code>')
     .replace(/^\- (.+)$/gm,'<li>$1</li>')
     .replace(/((?:\n<li>.+<\/li>)+)/g,'\n<ul>$1</ul>\n')
+    // markdown 表格：连续以 | 开头的行 → <table>（须在 <br> 转换前）
+    .replace(/(^[ \t]*\|.*\|\s*$\n?)+/gm, renderTableBlock)
     .replace(/\n{2,}/g,'\n\n')
     .replace(/\n/g,'<br>')
     .replace(/---/g,'<hr>');
+}
+
+/* LaTeX 公式渲染：KaTeX auto-render（defer 脚本加载后 renderMathInElement 才可用，运行时判空） */
+const KATEX_DELIMS = [
+  {left:'$$', right:'$$', display:true},
+  {left:'\\[', right:'\\]', display:true},
+  {left:'\\(', right:'\\)', display:false},
+  {left:'$', right:'$', display:false}
+];
+function katexRender(el) {
+  if (el && window.renderMathInElement) {
+    try { window.renderMathInElement(el, {throwOnError:false, delimiters:KATEX_DELIMS}); } catch(e) {}
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════
