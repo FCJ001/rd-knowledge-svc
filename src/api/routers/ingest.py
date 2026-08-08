@@ -19,6 +19,7 @@ from src.core.base_schema import ResponseSchema
 from src.core.deps import UserContext, get_current_user
 from src.core.exceptions import ERR_INGEST_FAILED, BizException
 from src.core.logger import logger
+from src.core.rate_limit import check_rate_limit
 from src.infra.db import get_db
 from src.knowledge.doc_ingestion import delete_doc as delete_doc_service
 from src.knowledge.doc_ingestion import ingest_and_index
@@ -54,6 +55,7 @@ async def upload_doc(
     model_code: str = "",
     chunk_strategy: str = "fixed",
     parser: str = "mineru",
+    rate_limit: None = Depends(check_rate_limit),
     user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):

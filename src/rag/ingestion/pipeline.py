@@ -21,7 +21,7 @@ from pymilvus import DataType, Function, FunctionType, MilvusClient
 from src.core.config import get_settings
 from src.infra.minio_client import ensure_bucket_exists, upload_file
 from src.rag.config import ChunkingConfig
-from src.rag.ingestion.chunkers import get_chunker
+from src.rag.ingestion.chunkers import get_chunker, merge_short_chunks
 from src.rag.ingestion.parsers import DocumentParser
 
 settings = get_settings()
@@ -145,12 +145,6 @@ class IngestionPipeline:
         """返回 doc_id"""
         doc_id = hashlib.md5(meta.doc_name.encode()).hexdigest()[:16]
 
-        # 幂等：先删后插
-        self.milvus.delete(
-            collection_name=COLLECTION_NAME,
-            filter=f'doc_id == "{doc_id}"',
-        )
-
         # 1. parse — MinerU 返回 (md_text, pages, images_dict)
         md_text, pages, images = await self.parser.parse(file_path)
         if not md_text or len(md_text.strip()) < 10:
@@ -159,7 +153,7 @@ class IngestionPipeline:
 
         # ★ 上传图片到 MinIO，替换 markdown 引用为 MinIO URL
         if images:
-            md_text = self._upload_images_and_replace_refs(
+            md_text = await self._upload_images_and_replace_refs(
                 md_text, images, doc_id, meta.doc_name,
             )
 
@@ -172,6 +166,13 @@ class IngestionPipeline:
             "doc_type": meta.doc_type,
         })
 
+        # ★ 短 chunk 合并：碎片并入相邻块，减少检索稀释
+        chunks = merge_short_chunks(
+            chunks,
+            min_chars=self.chunking_config.merge_min_chars,
+            max_chars=self.chunking_config.merge_max_chars,
+        )
+
         if not chunks:
             logger.warning(f"切片后无内容: {meta.doc_name}")
             return doc_id
@@ -180,6 +181,12 @@ class IngestionPipeline:
 
         # 3. embed (only dense — sparse 由 Milvus BM25 Function 自动生成)
         dense_vecs = await dense_embedder.embed(texts)
+
+        # 幂等：解析/切片/嵌入全部成功后才删旧数据，失败时保留旧版本文档
+        self.milvus.delete(
+            collection_name=COLLECTION_NAME,
+            filter=f'doc_id == "{doc_id}"',
+        )
 
         # 4. index (batch=50)
         batch_size = 50
@@ -215,10 +222,11 @@ class IngestionPipeline:
 
         return doc_id
 
-    def _upload_images_and_replace_refs(
+    async def _upload_images_and_replace_refs(
         self, md_text: str, images: dict[str, bytes], doc_id: str, doc_name: str,
     ) -> str:
-        """上传图片到 MinIO，替换 markdown 中 `![](images/xxx.jpg)` 为 `![](minio_url)`"""
+        """上传图片到 MinIO；开启 VL 时用 qwen-vl-max 生成图片描述，
+        替换 markdown 中 `![](images/xxx.jpg)` 为 `![描述](minio_url)`。"""
         ensure_bucket_exists()
         for img_name, img_bytes in images.items():
             # 确定 content_type
@@ -242,9 +250,17 @@ class IngestionPipeline:
             scheme = "https" if settings.MINIO_SECURE else "http"
             minio_url = f"{scheme}://{settings.MINIO_ENDPOINT}/{settings.MINIO_BUCKET}/{object_name}"
 
-            # 替换 markdown 中的图片引用
-            md_text = md_text.replace(f"](images/{img_name})", f"]({minio_url})")
-            md_text = md_text.replace(f"]({img_name})", f"]({minio_url})")
+            # ★ VL 摘要：描述写入 alt，检索可命中图片内容（fail-open：失败则 alt 为空）
+            summary = ""
+            if settings.IMAGE_SUMMARIZE_ENABLED:
+                from src.rag.ingestion.image_summarizer import summarize_image
+                summary = await summarize_image(img_bytes, content_type, settings.VL_MODEL)
+            alt = f"[{summary}]" if summary else "[]"
+
+            # 替换 markdown 中的图片引用：![]() → ![summary](minio_url)
+            for ref in (f"images/{img_name}", img_name):
+                md_text = md_text.replace(f"![]({ref})", f"!{alt}({ref})")
+                md_text = md_text.replace(f"]({ref})", f"]({minio_url})")
 
         logger.info(f"图片上传 MinIO 完成: {doc_name} ({len(images)} 张)")
         return md_text

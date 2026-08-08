@@ -12,6 +12,8 @@ class ChunkingConfig:
     chunk_overlap: int = 64
     strategy: str = "fixed"  # "fixed" | "semantic" | "parent_child"
     parent_chunk_size: int = 2048
+    merge_min_chars: int = 200   # 短 chunk 合并阈值：块长低于此值视为碎片
+    merge_max_chars: int = 800   # 合并后总长上限，避免大块被撑爆
 
 
 @dataclass

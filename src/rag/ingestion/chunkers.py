@@ -98,6 +98,48 @@ class ParentChildChunker:
         return chunks
 
 
+def merge_short_chunks(
+    chunks: list[Chunk],
+    min_chars: int = 200,
+    max_chars: int = 800,
+) -> list[Chunk]:
+    """合并相邻的短 chunk，减少检索碎片。
+
+    规则：
+    - 当前 chunk 或上一个 chunk 长度 < min_chars 视为碎片，尝试并入前一块；
+    - 合并后总长 <= max_chars 才合并，否则保留独立；
+    - parent_child 策略下两者 parent_index 必须相同（跨父块不合并）；
+    - 合并后重新编号 chunk_index，元数据保留首块（含 parent_text）。
+    """
+    if not chunks:
+        return []
+
+    result: list[Chunk] = []
+    for cur in chunks:
+        if not result:
+            result.append(Chunk(text=cur.text, metadata=dict(cur.metadata)))
+            continue
+        last = result[-1]
+        pa = last.metadata.get("parent_index")
+        pb = cur.metadata.get("parent_index")
+        same_parent = pa is None or pb is None or pa == pb
+        if (
+            (len(cur.text) < min_chars or len(last.text) < min_chars)
+            and len(last.text) + len(cur.text) <= max_chars
+            and same_parent
+        ):
+            result[-1] = Chunk(
+                text=last.text + "\n\n" + cur.text,
+                metadata=dict(last.metadata),
+            )
+        else:
+            result.append(Chunk(text=cur.text, metadata=dict(cur.metadata)))
+
+    for i, c in enumerate(result):
+        c.metadata["chunk_index"] = i
+    return result
+
+
 def get_chunker(config: ChunkingConfig, embedding_model: DashScopeEmbeddings = None):
     if config.strategy == "semantic":
         if embedding_model is None:

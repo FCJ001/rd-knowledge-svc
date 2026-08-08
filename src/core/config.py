@@ -68,6 +68,16 @@ class Settings(BaseSettings):
     RAG_RERANK_TOP_K: int = 5
     RAG_HYDE_ENABLED: bool = False
     RAG_HYBRID_ENABLED: bool = False
+    RAG_DYNAMIC_TOPK: bool = True  # Rerank 后按分数断崖动态截断（最多 10 条）
+
+    # ---------------- 图片 VL 摘要 ----------------
+    VL_MODEL: str = "qwen-vl-max"
+    IMAGE_SUMMARIZE_ENABLED: bool = True  # 入库时对每张图片调用 VL 生成描述写入 markdown
+
+    # ---------------- API 限流 ----------------
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_MAX_REQUESTS: int = 20     # 每个 user_id 每个滑动窗口内最多请求数
+    RATE_LIMIT_WINDOW_SECONDS: int = 60   # 滑动窗口时长（秒）
 
     # ---------------- NL2SQL（查项目一业务库 rd_agent）----------------
     ALM_DB_USER: str = "rdagent"
