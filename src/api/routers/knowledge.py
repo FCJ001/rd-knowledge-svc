@@ -6,7 +6,11 @@
 # GET  /api/v1/knowledge/docs      文档列表
 # ============================================================
 
-from fastapi import APIRouter, Depends, HTTPException
+import asyncio
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +19,7 @@ from src.core.base_schema import PageResult, ResponseSchema
 from src.core.deps import PageParams, UserContext, get_current_user
 from src.core.exceptions import ERR_BAD_REQUEST, ERR_NOT_FOUND, BizException
 from src.core.logger import logger
+from src.core.rate_limit import check_rate_limit
 from src.infra.db import get_db
 from src.infra.milvus_client import get_milvus_client
 from src.infra.neo4j_client import get_neo4j_driver
@@ -60,6 +65,7 @@ class FeedbackRequest(BaseModel):
 @router.post("/search", response_model=ResponseSchema[SearchResponse])
 async def search_knowledge(
     req: SearchRequest,
+    rate_limit: None = Depends(check_rate_limit),
     user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -124,6 +130,119 @@ async def search_knowledge(
         answer=answer,
         channels=req.channels,
     ))
+
+
+@router.post("/search-stream")
+async def search_knowledge_stream(
+    req: SearchRequest,
+    request: Request,
+    rate_limit: None = Depends(check_rate_limit),
+    user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """多通道知识检索 — SSE 流式：检索进度事件 + 答案 token 流式输出。
+
+    事件格式（data: {...}\n\n）：
+      {"type":"progress","channel":"doc_rag","status":"ok|empty|failed|skipped","count":N}
+      {"type":"delta","content":"答案片段"}
+      {"type":"done","answer":"完整答案","contexts":[...]}
+      {"type":"error","content":"错误信息"}
+    """
+    llm = get_llm()
+    embedding_model = get_embedding_model()
+    milvus_client = get_milvus_client()
+    neo4j_driver = get_neo4j_driver()
+
+    # ── Token 追踪 ──
+    token_tracker = TokenTracker()
+    llm = llm.with_config({"callbacks": [token_tracker]})
+
+    from src.knowledge.audit import QueryAuditLog, Timer
+    from src.knowledge.fusion import multi_channel_search
+
+    async def event_stream():
+        queue: asyncio.Queue = asyncio.Queue()
+        answer_chunks: list[str] = []
+        stream_contexts: list = []
+
+        def sink(msg: dict):
+            queue.put_nowait(msg)
+
+        async def run_to_queue():
+            try:
+                await multi_channel_search(
+                    question=req.question,
+                    llm=llm,
+                    embedding_model=embedding_model,
+                    milvus_client=milvus_client,
+                    neo4j_driver=neo4j_driver,
+                    db_session=db if "nl2sql" in req.channels else None,
+                    channels=req.channels,
+                    role=user.role,
+                    use_hyde=req.use_hyde,
+                    event_sink=sink,
+                )
+            except Exception as e:
+                logger.error(f"流式知识检索失败: {e}")
+                await queue.put({"type": "error", "content": str(e)})
+            finally:
+                await queue.put(None)  # sentinel
+
+        task = asyncio.ensure_future(run_to_queue())
+
+        with Timer() as timer:
+            try:
+                while True:
+                    msg = await queue.get()
+                    if msg is None:
+                        break
+                    if msg.get("type") == "delta":
+                        answer_chunks.append(msg.get("content", ""))
+                    elif msg.get("type") == "done":
+                        stream_contexts = msg.get("contexts") or []
+                    yield f"data: {json.dumps(msg, ensure_ascii=False)}\n\n"
+            finally:
+                await task  # ensure pipeline completes
+
+        answer = "".join(answer_chunks)
+
+        # ── 查询审计日志（检索链路在 API 端点落审计）──
+        QueryAuditLog.log(
+            user_id=user.user_id,
+            role=user.role,
+            question=req.question,
+            intent="multi_channel",
+            channels=req.channels,
+            answer_preview=answer,
+            duration_ms=timer.elapsed_ms,
+        )
+
+        # ── Guardrails 输出检查 ──
+        safe, reason = check_output(answer)
+        if not safe:
+            logger.warning(f"[Guardrails] 知识检索输出检查: {reason}")
+
+        # ── 异步评估（fire-and-forget，按采样率触发）──
+        evaluator = get_async_evaluator()
+        evaluator.evaluate_knowledge(question=req.question, answer=answer, contexts=stream_contexts, token_usage=token_tracker.usage)
+
+        # ── Token 用量 ──
+        usage = token_tracker.usage
+        logger.info(
+            f"[Token] 知识检索流式 input={usage['input_tokens']} output={usage['output_tokens']} "
+            f"total={usage['total_tokens']} calls={usage['calls']} "
+            f"cost=${usage['cost_usd']:.6f}"
+        )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/feedback", response_model=ResponseSchema[dict])

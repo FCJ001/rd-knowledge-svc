@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
@@ -22,6 +23,35 @@ from src.knowledge.hallucination_check import check_hallucination
 from src.knowledge.prompts import FUSION_PROMPT
 
 
+def _emit(event_sink: Callable[[dict], None] | None, msg: dict) -> None:
+    if event_sink is not None:
+        event_sink(msg)
+
+
+async def _generate_answer(
+    llm: BaseChatModel,
+    prompt: str,
+    event_sink: Callable[[dict], None] | None = None,
+) -> str:
+    """生成回答。
+
+    event_sink 存在时用 astream 逐 token 推送 {"type":"delta","content":...}，
+    供 SSE 流式消费；否则 ainvoke 一次性返回（保持原有行为）。
+    """
+    messages = [SystemMessage(content=prompt)]
+    if event_sink is None:
+        response = await llm.ainvoke(messages)
+        return response.content
+
+    answer_parts = []
+    async for chunk in llm.astream(messages):
+        content = getattr(chunk, "content", None)
+        if content:
+            answer_parts.append(content)
+            event_sink({"type": "delta", "content": content})
+    return "".join(answer_parts)
+
+
 async def multi_channel_search(
     question: str,
     llm: BaseChatModel,
@@ -32,9 +62,13 @@ async def multi_channel_search(
     channels: list[str] | None = None,
     role: str = "engineer",
     use_hyde: bool = False,
+    event_sink: Callable[[dict], None] | None = None,
 ) -> dict:
     """
     多通道并行检索 → 结果融合 → 幻觉检测 → 返回 {"answer": str, "contexts": list[str]}。
+
+    event_sink: 可选回调，推流式事件：检索进度 {"type":"progress",...}、
+    答案 token {"type":"delta",...}、结束 {"type":"done",...}。
     """
     if channels is None:
         channels = ["doc_rag", "graph_rag"]
@@ -53,14 +87,29 @@ async def multi_channel_search(
 
     logger.info(f"多通道检索开始: channels={list(tasks.keys())}")
 
+    # asyncio.wait(FIRST_COMPLETED)：每完成一个通道立即推进度事件，
+    # 比 gather 一次性返回更贴近流式体验
     results = {}
-    gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
-    for key, result in zip(tasks.keys(), gathered):
-        if isinstance(result, Exception):
-            logger.warning(f"通道 {key} 检索失败: {result}")
-            results[key] = None
-        else:
+    pending = {asyncio.create_task(coro, name=key) for key, coro in tasks.items()}
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            key = task.get_name()
+            try:
+                result = task.result()
+            except Exception as e:
+                logger.warning(f"通道 {key} 检索失败: {e}")
+                results[key] = None
+                _emit(event_sink, {"type": "progress", "channel": key, "status": "failed", "count": 0})
+                continue
             results[key] = result
+            if isinstance(result, list):
+                count, status = len(result), ("ok" if result else "empty")
+            elif isinstance(result, str) and result:
+                count, status = 1, "ok"
+            else:
+                count, status = 0, "skipped"
+            _emit(event_sink, {"type": "progress", "channel": key, "status": status, "count": count})
 
     # ── 汇总命中情况 ──
     summary_parts = []
@@ -106,15 +155,14 @@ async def multi_channel_search(
         evidence_parts.append(sql_answer[:1000])
 
     if not source_parts:
-        return {
-            "answer": "所有检索通道均未找到与您问题相关的信息。",
-            "contexts": [],
-        }
+        answer = "所有检索通道均未找到与您问题相关的信息。"
+        _emit(event_sink, {"type": "done", "answer": answer, "contexts": []})
+        return {"answer": answer, "contexts": []}
 
     sources = "\n\n".join(source_parts)
     prompt = FUSION_PROMPT.format(question=question, sources=sources, role=role)
-    response = await llm.ainvoke([SystemMessage(content=prompt)])
-    answer = response.content
+    answer = await _generate_answer(llm, prompt, event_sink)
+    _emit(event_sink, {"type": "done", "answer": answer, "contexts": retrieved_chunks})
 
     evidence = "\n".join(evidence_parts)
     hal_result = await check_hallucination(question, evidence, answer, llm)

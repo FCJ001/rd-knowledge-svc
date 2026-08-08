@@ -26,56 +26,87 @@ async def search_docs_raw(
     model_code: str | None = None,  # ★ 新增
     llm: BaseChatModel | None = None,
     use_hyde: bool = False,
+    use_dynamic_topk: bool | None = None,
 ) -> list[dict]:
-    """文档向量检索，返回原始结果列表"""
+    """文档多路召回：原始查询 / HyDE（可选）/ BM25 三路 → RRF 融合 → 精排。
 
+    与单路 dense 检索相比：
+    - use_hyde 不再"替代"查询向量，而是作为额外 dense 通道参与 RRF（HyDE 从"替代"变"增加"）；
+    - BM25 通道提供词法召回兜底（本项目是内部知识库，用 BM25 代替外部联网检索）；
+    - hybrid（RRF）失败自动降级为旧 dense-only 检索，再失败返回 []。
+    """
+
+    # 始终计算原始查询向量；use_hyde 时额外算 HyDE 向量作为第二路 dense
+    query_vec = await embedding_model.aembed_query(question)
+    extra_dense_queries = None
     if use_hyde and llm is not None:
         from src.knowledge.hyde import generate_hyde_embedding
-        query_vec = await generate_hyde_embedding(question, llm, embedding_model)
-    else:
-        query_vec = await embedding_model.aembed_query(question)
+        hyde_vec = await generate_hyde_embedding(question, llm, embedding_model)
+        extra_dense_queries = [hyde_vec]
 
-    # 构建过滤表达式
-    filter_parts = []
+    filters = {}
     if doc_type:
-        filter_parts.append(f'doc_type == "{doc_type}"')
+        filters["doc_type"] = doc_type
     if model_code:
-        filter_parts.append(f'model_code == "{model_code}"')  # ★
-    filter_expr = " and ".join(filter_parts) if filter_parts else None
+        filters["model_code"] = model_code  # ★
+
     logger.info(
-        f"DocRAG 检索: top_k={top_k} hyde={use_hyde} "
-        f"filter={filter_expr or '无'} model_code={model_code or '不限'}"
+        f"DocRAG 多路召回: top_k={top_k} hyde={use_hyde} "
+        f"filter={filters or '无'} model_code={model_code or '不限'}"
     )
 
+    hits = []
     try:
-        results = milvus_client.search(
-            collection_name=COLLECTION_NAME,
-            data=[query_vec],
-            limit=top_k,
-            output_fields=["doc_name", "doc_type", "page_number", "chunk_index", "text", "parent_text", "image_urls"],
-            anns_field="embedding",
-            search_params={"metric_type": "COSINE", "params": {"nprobe": 16}},
-            filter=filter_expr,
+        from src.rag.retrieval.hybrid_search import hybrid_search
+        hits = await hybrid_search(
+            milvus_client,
+            COLLECTION_NAME,
+            dense_embedding=query_vec,
+            query_text=question,
+            top_k=top_k,
+            filters=filters or None,
+            extra_dense_queries=extra_dense_queries,
         )
     except Exception as e:
-        logger.warning(f"文档检索失败: {e}")
-        return []
+        # 降级：RRF 混合检索失败 → 回退旧 dense-only 检索，再失败返回 []
+        logger.warning(f"混合检索失败，降级为 dense-only: {e}")
+        try:
+            filter_parts = []
+            if doc_type:
+                filter_parts.append(f'doc_type == "{doc_type}"')
+            if model_code:
+                filter_parts.append(f'model_code == "{model_code}"')  # ★
+            filter_expr = " and ".join(filter_parts) if filter_parts else None
+            results = milvus_client.search(
+                collection_name=COLLECTION_NAME,
+                data=[query_vec],
+                limit=top_k,
+                output_fields=["doc_name", "doc_type", "page_number", "chunk_index", "text", "parent_text", "image_urls"],
+                anns_field="embedding",
+                search_params={"metric_type": "COSINE", "params": {"nprobe": 16}},
+                filter=filter_expr,
+            )
+            hits = [
+                {**hit["entity"], "score": hit.get("distance", 0.0)}
+                for hit in (results[0] if results and results[0] else [])
+            ]
+        except Exception as e2:
+            logger.warning(f"dense-only 检索也失败: {e2}")
+            return []
 
-    if not results or not results[0]:
+    if not hits:
         logger.info("DocRAG 召回: 0 条")
         return []
 
-    hits = [
-        {**hit["entity"], "score": hit.get("distance", 0.0)}
-        for hit in results[0]
-    ]
     logger.info(
         f"DocRAG 召回: {len(hits)} 条, top_score={hits[0]['score']:.4f}, "
         f"来源: {list(set(h['doc_name'] for h in hits[:5]))}"
     )
 
     from src.knowledge.reranker import rerank_docs
-    reranked = await rerank_docs(question, hits, top_k=rerank_top_k)
+    reranked = await rerank_docs(
+        question, hits, top_k=rerank_top_k, use_dynamic_topk=use_dynamic_topk
+    )
     logger.info(
         f"DocRAG 精排后: {len(reranked)} 条 (rerank_top_k={rerank_top_k}), "
         f"top_score={reranked[0].get('rerank_score', reranked[0]['score']):.4f}"
@@ -129,13 +160,14 @@ async def search_docs(
     model_code: str | None = None,
     role: str = "engineer",
     use_hyde: bool = True,
+    use_dynamic_topk: bool | None = None,
 ) -> str:
-    """DocRAG 完整流程：检索 + 精排 + HyDE + 生成回答"""
+    """DocRAG 完整流程：多路检索 + 精排 + HyDE + 生成回答"""
     hits = await search_docs_raw(
         question, embedding_model, milvus_client,
         top_k=top_k, rerank_top_k=rerank_top_k,
         doc_type=doc_type, model_code=model_code,
-        llm=llm, use_hyde=use_hyde,
+        llm=llm, use_hyde=use_hyde, use_dynamic_topk=use_dynamic_topk,
     )
     if not hits:
         return "当前知识库中未找到与您问题相关的文档内容。"

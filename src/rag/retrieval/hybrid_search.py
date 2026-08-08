@@ -13,7 +13,14 @@ async def hybrid_search(
     query_text: str,
     top_k: int = 20,
     filters: dict | None = None,
+    extra_dense_queries: list[list[float]] | None = None,
 ) -> list[dict]:
+    """Dense + BM25 混合检索（RRF 融合）。
+
+    extra_dense_queries: 额外 dense 查询向量（如 HyDE 假设文档向量），
+    每个向量独立成为一个 COSINE AnnSearchRequest，参与同一 RRF 融合，
+    用于 doc 通道内部的多路并行召回（原始查询 / HyDE / BM25）。
+    """
     filter_expr = _build_filter(filters) if filters else ""
 
     dense_req = AnnSearchRequest(
@@ -31,12 +38,23 @@ async def hybrid_search(
         expr=filter_expr,
     )
 
+    extra_reqs = [
+        AnnSearchRequest(
+            data=[vec],
+            anns_field="embedding",
+            param={"metric_type": "COSINE", "params": {"nprobe": 16}},
+            limit=top_k,
+            expr=filter_expr,
+        )
+        for vec in (extra_dense_queries or [])
+    ]
+
     results = milvus.hybrid_search(
         collection_name=collection_name,
-        reqs=[dense_req, sparse_req],
+        reqs=[dense_req, sparse_req, *extra_reqs],
         ranker=RRFRanker(k=60),
         limit=top_k,
-        output_fields=["text", "doc_name", "doc_type", "category", "chunk_index", "parent_text", "image_urls"],
+        output_fields=["text", "doc_name", "doc_type", "category", "page_number", "chunk_index", "parent_text", "image_urls"],
     )
 
     hits = []
@@ -46,6 +64,7 @@ async def hybrid_search(
             "parent_text": hit["entity"].get("parent_text", ""),
             "doc_name": hit["entity"]["doc_name"],
             "doc_type": hit["entity"]["doc_type"],
+            "page_number": hit["entity"].get("page_number", ""),
             "score": hit["distance"],
             "chunk_index": hit["entity"]["chunk_index"],
             "image_urls": hit["entity"].get("image_urls", ""),

@@ -395,6 +395,7 @@ body {
         </select>
         <input type="text" id="modelCode" placeholder="车型代码" oninput="store.modelCode=this.value" style="width:100px;">
         <label title="文档检索专用：用 LLM 生成假设回答再检索，提升语义召回（多一次模型调用，更慢）"><input type="checkbox" id="useHyde" onchange="store.useHyde=this.checked"> HyDE</label>
+        <label title="SSE 流式：检索进度 + 打字机回答，默认开启"><input type="checkbox" id="useStream" checked> 流式回答</label>
       </div>
       <div id="searchResults"></div>
     </div>
@@ -581,6 +582,10 @@ async function doSearch() {
   const input = document.getElementById('searchInput');
   const q = input.value.trim();
   if (!q) return;
+  // 流式回答默认勾选 → 走 SSE 流式；取消勾选 → 非流式
+  if (document.getElementById('useStream')?.checked) {
+    return doSearchStream();
+  }
   store.channels = selectedChannels();
   store.lastSearchQuestion = q;
   store.lastSearchChannels = store.channels.join(',');
@@ -637,6 +642,109 @@ function renderSearchResult(question, data) {
 function rerunSearch(idx) {
   const q = searchHistory[idx];
   if (q) { document.getElementById('searchInput').value = q; switchPage('search'); doSearch(); }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   流式问答 — SSE 消费 /api/v1/knowledge/search-stream
+   progress → 通道徽章；delta → 打字机回答；done/error → 收尾
+   ══════════════════════════════════════════════════════════════ */
+function updateChannelTags(container, p) {
+  const map = {ok:'✅', empty:'🔍', failed:'❌', skipped:'⏭️'};
+  const label = `${map[p.status]||'❓'} ${p.channel} ${p.status==='ok' ? p.count+'条' : p.status}`;
+  [...container.children].forEach(c => { if (c.textContent.includes(p.channel)) c.remove(); });
+  const el = document.createElement('span');
+  el.className = 'channel-tag';
+  el.textContent = label;
+  container.appendChild(el);
+}
+
+async function doSearchStream() {
+  const input = document.getElementById('searchInput');
+  const q = input.value.trim();
+  if (!q) return;
+  store.channels = selectedChannels();
+  store.lastSearchQuestion = q;
+  store.lastSearchChannels = store.channels.join(',');
+
+  // Save to history
+  if (!searchHistory.includes(q)) { searchHistory.unshift(q); if (searchHistory.length>50) searchHistory.pop(); }
+  localStorage.setItem('rd_search_history', JSON.stringify(searchHistory));
+
+  const btn = document.getElementById('searchBtn');
+  btn.disabled = true;
+  const box = document.getElementById('searchResults');
+
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  card.innerHTML = `
+    <div class="rc-header">
+      <span style="font-size:13px;font-weight:600;color:var(--title);">${escHtml(q)}</span>
+      <div style="flex:1"></div>
+      <span class="channel-tag">⚡ 流式</span>
+    </div>
+    <div class="channel-tags" style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;"></div>
+    <div class="rc-body" style="white-space:pre-wrap;">⏳ 检索中…</div>
+    <div class="rc-footer" style="display:none;">
+      <span style="font-size:12px;color:var(--muted);">回答对你有帮助吗？</span>
+      <button class="feedback-btn" id="fbUp" onclick="submitFeedback(1)">👍 有用</button>
+      <button class="feedback-btn" id="fbDown" onclick="submitFeedback(-1)">👎 无用</button>
+    </div>`;
+  box.innerHTML = '';
+  box.appendChild(card);
+  const tagsEl = card.querySelector('.channel-tags');
+  const answerEl = card.querySelector('.rc-body');
+  const footerEl = card.querySelector('.rc-footer');
+
+  let answerText = '';
+  try {
+    const resp = await fetch(BASE+'/api/v1/knowledge/search-stream',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-User-Id':'web','X-User-Role':store.role},
+      body: JSON.stringify({question:q, channels:store.channels, doc_type:store.docType, model_code:store.modelCode, use_hyde:store.useHyde})
+    });
+    if (!resp.ok || !resp.headers.get('content-type')?.includes('text/event-stream')) {
+      throw new Error('非 SSE 响应');
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const payload = JSON.parse(line.slice(6));
+          if (payload.type === 'progress') {
+            updateChannelTags(tagsEl, payload);
+          } else if (payload.type === 'delta') {
+            answerText += payload.content || '';
+            answerEl.innerHTML = renderMarkdown(answerText);
+            answerEl.scrollIntoView({behavior:'smooth', block:'nearest'});
+          } else if (payload.type === 'done') {
+            answerEl.innerHTML = renderMarkdown(answerText);
+          } else if (payload.type === 'error') {
+            answerEl.innerHTML = `<div class="empty-state">⚠️ ${escHtml(payload.content||'未知错误')}</div>`;
+          }
+        } catch(ignored) {}
+      }
+    }
+
+    store.lastSearchAnswer = answerText;
+    if (!answerText) {
+      answerEl.innerHTML = '<div class="empty-state">未找到相关内容</div>';
+    } else {
+      footerEl.style.display = '';
+    }
+  } catch(e) {
+    box.innerHTML = `<div class="empty-state"><div class="empty-icon">⚠️</div>请求失败：${escHtml(e.message)}</div>`;
+  }
+  btn.disabled = false;
+  renderHistory();
 }
 
 async function submitFeedback(rating) {
