@@ -226,8 +226,10 @@ class IngestionPipeline:
         self, md_text: str, images: dict[str, bytes], doc_id: str, doc_name: str,
     ) -> str:
         """上传图片到 MinIO；开启 VL 时用 qwen-vl-max 生成图片描述，
-        替换 markdown 中 `![](images/xxx.jpg)` 为 `![描述](minio_url)`。"""
+        替换 markdown 中 `![](images/xxx.jpg)` 为 `![描述](minio_url)`；
+        未被 markdown 引用的"孤儿图"追加到文档末尾，保证图片内容也可被检索。"""
         ensure_bucket_exists()
+        orphaned: list[str] = []  # 追加用的 ![描述](url) 片段
         for img_name, img_bytes in images.items():
             # 确定 content_type
             ext = img_name.rsplit(".", 1)[-1].lower() if "." in img_name else "jpg"
@@ -262,9 +264,21 @@ class IngestionPipeline:
             alt = f"[{summary}]" if summary else "[]"
 
             # 替换 markdown 中的图片引用：![]() → ![summary](minio_url)
+            referenced = any(
+                f"![]({ref})" in md_text or f"]({ref})" in md_text
+                for ref in (f"images/{img_name}", img_name)
+            )
             for ref in (f"images/{img_name}", img_name):
                 md_text = md_text.replace(f"![]({ref})", f"!{alt}({ref})")
                 md_text = md_text.replace(f"]({ref})", f"]({minio_url})")
+
+            # ★ 孤儿图：markdown 中无引用，追加到文档末尾使其可被检索
+            if not referenced:
+                orphaned.append(f"![{summary}]({minio_url})")
+
+        if orphaned:
+            md_text = f"{md_text}\n\n## 附：文档配图\n" + "\n\n".join(orphaned)
+            logger.info(f"追加 {len(orphaned)} 张未引用图片到文档末尾")
 
         logger.info(f"图片上传 MinIO 完成: {doc_name} ({len(images)} 张)")
         return md_text
