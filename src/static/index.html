@@ -161,6 +161,23 @@ body {
 .result-card .rc-body table { border-collapse:collapse; margin:8px 0; width:100%; }
 .result-card .rc-body th,.result-card .rc-body td { border:1px solid var(--border); padding:6px 10px; font-size:13px; text-align:left; }
 .result-card .rc-body th { background:var(--bg); font-weight:600; }
+.result-card .rc-body .rc-table-wrap { border:1px solid var(--border); border-radius:8px; margin:8px 0; overflow:hidden; }
+.result-card .rc-body .rc-table-wrap > table { margin:0; }
+.result-card .rc-body .rc-table-bar { display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:4px 10px; background:var(--bg); border-bottom:1px solid var(--border); font-size:12px; }
+.result-card .rc-body .rc-tbl-warn { color:#b8860b; margin-right:auto; }
+.result-card .rc-body .rc-tbl-btn { background:transparent; border:1px solid var(--border); border-radius:4px; padding:1px 10px; font-size:12px; color:var(--title); cursor:pointer; }
+.result-card .rc-body .rc-tbl-btn:hover { background:var(--title); color:var(--bg); }
+.result-card .rc-body .rc-table-originals { display:block; padding:8px; border-top:1px dashed var(--border); }
+.result-card .rc-body .rc-table-originals[hidden] { display:none; }
+.result-card .rc-body .rc-table-originals img { display:block; max-width:100%; margin:0 auto 8px; border-radius:6px; }
+.result-card .rc-body .rc-formula-wrap { margin:8px 0; }
+.result-card .rc-body .rc-formula-bar { display:flex; align-items:center; justify-content:flex-end; gap:8px; font-size:12px; }
+.result-card .rc-body .rc-formula-tag { color:var(--muted); margin-right:auto; }
+.result-card .rc-body .rc-formula-btn { background:transparent; border:1px solid var(--border); border-radius:4px; padding:1px 10px; font-size:12px; color:var(--title); cursor:pointer; }
+.result-card .rc-body .rc-formula-btn:hover { background:var(--title); color:var(--bg); }
+.result-card .rc-body .rc-formula-originals { display:block; padding:8px; margin-top:4px; border:1px dashed var(--border); border-radius:6px; }
+.result-card .rc-body .rc-formula-originals[hidden] { display:none; }
+.result-card .rc-body .rc-formula-originals img { display:block; max-width:100%; margin:0 auto 8px; border-radius:6px; }
 .result-card .rc-body img.rc-inline-img { max-width:100%; max-height:320px; margin:8px 0; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.15); }
 .result-card .rc-footer { display:flex; align-items:center; gap:12px; margin-top:16px; padding-top:12px; border-top:1px solid var(--border); }
 .feedback-btn {
@@ -1192,8 +1209,99 @@ function renderTableBlock(block) {
   return h + '</tbody></table>';
 }
 
+/* 复杂表 HTML 净化：白名单去风险（内容来自内部文档但经 LLM 透传，仍防 XSS） */
+function sanitizeTableHtml(html) {
+  return html
+    .replace(/<script\b[\s\S]*?<\/script\s*>/gi, '')
+    .replace(/<iframe\b[\s\S]*?<\/iframe\s*>/gi, '')
+    .replace(/<object\b[\s\S]*?<\/object\s*>/gi, '')
+    .replace(/<embed\b[^>]*>/gi, '')
+    .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/(href|src)\s*=\s*("|')(?:javascript|vbscript|data:(?!image\/))[^"']*\2/gi, '$1=""');
+}
+
+/* 表格原图折叠（方案A）：原图默认收起，右上角"查看原图"按需展开；
+   复杂表（多行/含合并单元格）额外挂"识别可能有误"徽标，作 OCR 风险提示 */
+function isComplexTable(html) {
+  const rows = (html.match(/<tr\b/gi) || []).length;
+  const spans = (html.match(/\b(?:colspan|rowspan)\s*=/gi) || []).length;
+  return rows >= 8 || spans > 0;
+}
+
+function renderTableWithOriginals(block) {
+  const tableMatch = block.match(/<table\b[\s\S]*?<\/table\s*>/i);
+  const tableHtml = tableMatch ? sanitizeTableHtml(tableMatch[0]) : '';
+  const imgUrls = [...block.matchAll(/!\[表格原图\]\((https?:\/\/[^\s)]+)\)/g)].map(m => m[1]);
+  const bar = [];
+  if (isComplexTable(tableHtml)) bar.push('<span class="rc-tbl-warn">⚠ 识别可能有误</span>');
+  if (imgUrls.length) bar.push(`<button type="button" class="rc-tbl-btn" onclick="toggleTableOriginals(this)">查看原图 (${imgUrls.length})</button>`);
+  const barHtml = bar.length ? `<div class="rc-table-bar">${bar.join('')}</div>` : '';
+  const originals = imgUrls.length
+    ? `<div class="rc-table-originals" hidden>${imgUrls.map(u => `<img loading="lazy" src="${escapeAttr(u)}" alt="表格原图">`).join('')}</div>`
+    : '';
+  return `<div class="rc-table-wrap">${barHtml}${tableHtml}${originals}</div>`;
+}
+
+function toggleTableOriginals(btn) {
+  const box = btn.closest('.rc-table-wrap')?.querySelector('.rc-table-originals');
+  if (!box) return;
+  const show = box.hidden;
+  box.hidden = !show;
+  const n = box.querySelectorAll('img').length;
+  btn.textContent = show ? `收起原图 (${n})` : `查看原图 (${n})`;
+}
+
+/* 公式原图折叠：与表格同款 —— 原图默认收起，"查看公式原图"按需展开，
+   避免每个公式下方顶一张大图撑开正文。block 可能是
+   "$$...$$\n\n![公式原图](url)"（行间公式对照）或
+   "## 公式原图（识别对照）\n![公式原图](url)..."（文末附录）。 */
+function renderFormulaWithOriginals(block) {
+  const formulaMatch = block.match(/\$\$[\s\S]+?\$\$/);
+  const isAppendix = /^## 公式原图（识别对照）/.test(block.replace(/^\s+/,''));
+  const imgUrls = [...block.matchAll(/!\[公式原图\]\((https?:\/\/[^\s)]+)\)/g)].map(m => m[1]);
+  const formulaHtml = formulaMatch
+    ? formulaMatch[0].replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    : '';
+  let bar = '';
+  if (imgUrls.length) {
+    const label = isAppendix ? '查看原图对照' : `查看公式原图 (${imgUrls.length})`;
+    const tag = isAppendix ? '<span class="rc-formula-tag">公式原图（识别对照）</span>' : '';
+    bar = `<div class="rc-formula-bar">${tag}<button type="button" class="rc-formula-btn" onclick="toggleFormulaOriginals(this)">${label}</button></div>`;
+  }
+  const originals = imgUrls.length
+    ? `<div class="rc-formula-originals" hidden>${imgUrls.map(u => `<img loading="lazy" src="${escapeAttr(u)}" alt="公式原图">`).join('')}</div>`
+    : '';
+  return `<div class="rc-formula-wrap">${bar}${formulaHtml}${originals}</div>`;
+}
+
+function toggleFormulaOriginals(btn) {
+  const box = btn.closest('.rc-formula-wrap')?.querySelector('.rc-formula-originals');
+  if (!box) return;
+  const show = box.hidden;
+  box.hidden = !show;
+  const n = box.querySelectorAll('img').length;
+  btn.textContent = show ? `收起原图 (${n})` : isFormulaAppendix(btn) ? '查看原图对照' : `查看公式原图 (${n})`;
+}
+
+function isFormulaAppendix(btn) {
+  return !!(btn.closest('.rc-formula-wrap')?.querySelector('.rc-formula-tag'));
+}
+
 function renderMarkdown(text) {
   if (!text) return '';
+  // ★ 公式原图折叠：$$...$$ 行间公式 + 紧跟的 ![公式原图](url) 一起抽出，
+  //   还原时折叠成"查看公式原图"按钮；无原图的公式不匹配，仍走 saveMath 正常渲染。
+  //   文末"## 公式原图（识别对照）"附录同样折叠成单按钮。
+  const formulaBlocks = [];
+  const saveFormulas = (t) => t.replace(/\$\$[\s\S]+?\$\$(?:\s*!\[公式原图\]\(https?:\/\/[^\s)]+\))+/g, m => {
+    formulaBlocks.push(m); return `\u0001F${formulaBlocks.length-1}\u0001`;
+  }).replace(/## 公式原图（识别对照）(?:\s*!\[公式原图\]\(https?:\/\/[^\s)]+\))+/g, m => {
+    formulaBlocks.push(m); return `\u0001F${formulaBlocks.length-1}\u0001`;
+  });
+  const restoreFormulas = (t) => t.replace(/\u0001F(\d+)\u0001/g, (_, i) => {
+    const block = formulaBlocks[+i];
+    return block ? renderFormulaWithOriginals(block) : '';
+  });
   // 保护多行公式块 $$...$$ 和 \[...\]：先抽出占位，避免换行被 <br> 拆散定界符
   const mathBlocks = [];
   const saveMath = (t) => t
@@ -1202,25 +1310,41 @@ function renderMarkdown(text) {
   // 还原时补 HTML 转义：&<> 转义后浏览器解码成文本，KaTeX 读到真实公式
   const restoreMath = (t) => t.replace(/\u0001M(\d+)\u0001/g, (_, i) =>
     mathBlocks[+i].replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'));
+  // ★ 复杂表保护：MinerU 复杂表输出 <table>...</table>，先抽出占位避免被整体转义成文本；
+  //   还原时做 HTML 净化（去 script/事件属性/危险 URL）。
+  //   表格原图（![表格原图](url)）紧跟 </table> 后，一并打包：默认折叠成"查看原图"按钮，
+  //   避免每张表都被一张大图撑开正文。
+  const tableBlocks = [];
+  const saveTables = (t) => t.replace(/<table\b[\s\S]*?<\/table\s*>(?:\s*!\[表格原图\]\(https?:\/\/[^\s)]+\))*/gi, m => {
+    tableBlocks.push(m); return `\u0001T${tableBlocks.length-1}\u0001`;
+  });
+  const restoreTables = (t) => t.replace(/\u0001T(\d+)\u0001/g, (_, i) => {
+    const block = tableBlocks[+i];
+    return block ? renderTableWithOriginals(block) : '';
+  });
 
-  return restoreMath(
-    saveMath(text)
-      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-      // 内联图片：![alt](http://...) → <img>（alt/src 已转义，引号再单独转义防属性逃逸）
-      .replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (m, alt, url) =>
-        `<a href="${url.replace(/"/g,'&quot;')}" target="_blank" rel="noopener"><img class="rc-inline-img" loading="lazy" alt="${alt.replace(/"/g,'&quot;')}" src="${url.replace(/"/g,'&quot;')}"></a>`)
-      .replace(/^### (.+)$/gm,'<h3>$1</h3>')
-      .replace(/^## (.+)$/gm,'<h2>$1</h2>')
-      .replace(/^# (.+)$/gm,'<h1>$1</h1>')
-      .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
-      .replace(/`([^`]+)`/g,'<code>$1</code>')
-      .replace(/^\- (.+)$/gm,'<li>$1</li>')
-      .replace(/((?:\n<li>.+<\/li>)+)/g,'\n<ul>$1</ul>\n')
-      // markdown 表格：连续以 | 开头的行 → <table>（须在 <br> 转换前）
-      .replace(/(^[ \t]*\|.*\|\s*$\n?)+/gm, renderTableBlock)
-      .replace(/\n{2,}/g,'\n\n')
-      .replace(/\n/g,'<br>')
-      .replace(/---/g,'<hr>')
+  return restoreFormulas(
+    restoreTables(
+      restoreMath(
+        saveMath(saveTables(saveFormulas(text)))
+          .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          // 内联图片：![alt](http://...) → <img>（alt/src 已转义，引号再单独转义防属性逃逸）
+          .replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (m, alt, url) =>
+            `<a href="${url.replace(/"/g,'&quot;')}" target="_blank" rel="noopener"><img class="rc-inline-img" loading="lazy" alt="${alt.replace(/"/g,'&quot;')}" src="${url.replace(/"/g,'&quot;')}"></a>`)
+          .replace(/^### (.+)$/gm,'<h3>$1</h3>')
+          .replace(/^## (.+)$/gm,'<h2>$1</h2>')
+          .replace(/^# (.+)$/gm,'<h1>$1</h1>')
+          .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+          .replace(/`([^`]+)`/g,'<code>$1</code>')
+          .replace(/^\- (.+)$/gm,'<li>$1</li>')
+          .replace(/((?:\n<li>.+<\/li>)+)/g,'\n<ul>$1</ul>\n')
+          // markdown 表格：连续以 | 开头的行 → <table>（须在 <br> 转换前）
+          .replace(/(^[ \t]*\|.*\|\s*$\n?)+/gm, renderTableBlock)
+          .replace(/\n{2,}/g,'\n\n')
+          .replace(/\n/g,'<br>')
+          .replace(/---/g,'<hr>')
+      )
+    )
   );
 }
 
@@ -1241,6 +1365,7 @@ function katexRender(el) {
    Helpers
    ══════════════════════════════════════════════════════════════ */
 function escHtml(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escapeAttr(s) { return String(s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 function toggleTheme() {
   const isDark = document.documentElement.getAttribute('data-theme')==='dark';

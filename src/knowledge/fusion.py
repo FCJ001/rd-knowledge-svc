@@ -83,19 +83,26 @@ async def _generate_answer(
 
 
 def _sanitize_answer_images(answer: str, valid_urls: set[str]) -> str:
-    """只保留答案中真实存在于检索源里的图片引用。
+    """只保留答案中真实存在于检索源里的图片引用，防 LLM 编造/抄占位符。
 
-    LLM 可能编造图片 URL。逐条校验答案里的 ![描述](url)：
-    url 在检索命中的图片集合内才保留完整引用，否则去掉引用只剩描述文字，
-    避免展示 404 图片。"""
-    if not valid_urls:
-        return answer
-
+    1) 地址含省略号（...）的引用是占位符编造，直接剥成描述文字；
+    2) 逐条校验剩余 ![描述](url)：url 在检索命中的图片集合内才保留完整引用，
+       否则去掉引用只剩描述文字（valid_urls 为空时全部不可信，一并剥掉）；
+    3) 裸占位 URL（非 markdown 形式）直接删除，避免展示 "http://...url.../"。"""
+    # ① 占位符引用（URL 含省略号）：剥成描述文字
+    answer = re.sub(
+        r"!\[([^\]]*)\]\((https?://[^\s)]*\.\.[^\s)]*)\)",
+        lambda m: m.group(1).strip(), answer,
+    )
+    # ② 校验剩余引用：URL 必须真实存在于检索源
     def _repl(m: re.Match) -> str:
         alt, url = m.group(1), m.group(2)
         return m.group(0) if url in valid_urls else alt.strip()
 
-    return re.sub(r"!\[([^\]]*)\]\((https?://[^\s)]+)\)", _repl, answer)
+    answer = re.sub(r"!\[([^\]]*)\]\((https?://[^\s)]+)\)", _repl, answer)
+    # ③ 裸占位 URL（http://... 开头，真实地址不会以省略号开头）连前一空格一并删除
+    answer = re.sub(r" ?https?://\.\.[^\s)\]\"']*", "", answer)
+    return answer
 
 
 def _extract_md_image_urls(text: str) -> list[str]:

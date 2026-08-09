@@ -29,6 +29,167 @@ settings = get_settings()
 COLLECTION_NAME = "alm_docs"
 EMBEDDING_DIM = 1024
 
+# 匹配 markdown 中的 HTML 表格（MinerU 复杂表格输出为 <table>）
+TABLE_HTML_RE = re.compile(r"<table\b[\s\S]*?</table>", re.IGNORECASE)
+
+# 行间公式 $$..$$（公式原图只嵌入行间公式）
+FORMULA_BLOCK_RE = re.compile(r"\$\$[\s\S]+?\$\$")
+
+
+def _normalize_table_html(html: str) -> str:
+    """去 HTML 标签与空白，用于 content_list table_body 与 md <table> 的匹配"""
+    text = re.sub(r"<[^>]+>", "", html or "")
+    return re.sub(r"[\s\u00a0]+", "", text)
+
+
+def _normalize_formula(text: str) -> str:
+    """去所有空白，用于 content_list equation.text 与 md $$..$$ token 的匹配"""
+    return re.sub(r"[\s\u00a0]+", "", text or "")
+
+
+def _locate_formula_rect(page, bbox: "pymupdf.Rect", md_before: str) -> "pymupdf.Rect | None":
+    """定位公式在页面上的真实渲染区域（pt 坐标）。
+
+    实测 MinerU content_list 的 equation 块 bbox 整体偏高 ~90-110pt、且高度不可靠，
+    直接用会裁到公式上方正文（如“（1）（2）”列表行）。因此：
+      1) 优先用 md 中公式前文本的尾行做锚点（page.search_for），锚点下方即公式顶；
+         公式底/宽用渲染密度扫描定：连续 >=3 行密集=正文段（如“式中：”），其顶即底；
+         公式内部分数条等单行密集不误判。
+      2) 锚点找不到（扫描版 PDF 无文本层）退化为在 bbox 下方扫描“稀疏公式带”。
+      3) 全部失败返回 None，调用方退回 bbox 留白裁剪。
+    """
+    import pymupdf
+
+    def _scan_band(top: float, bot: float):
+        clip_top = max(0.0, top)
+        clip_bot = min(page.rect.height, bot)
+        pix = page.get_pixmap(
+            matrix=pymupdf.Matrix(2.0, 2.0),
+            clip=pymupdf.Rect(0, clip_top, page.rect.width, clip_bot),
+            alpha=False,
+        )
+        w, h = pix.width, pix.height
+        cnt = [0] * h
+        xmin: list = [None] * h
+        xmax: list = [None] * h
+        for yy in range(h):
+            c = 0
+            mn = None
+            mx = None
+            for xx in range(w):
+                try:
+                    v = pix.pixel(xx, yy)[0]
+                except TypeError:
+                    v = pix.pixel(xx, yy)
+                if v < 128:
+                    c += 1
+                    if mn is None:
+                        mn = xx
+                    mx = xx
+            cnt[yy] = c
+            if c:
+                xmin[yy] = mn
+                xmax[yy] = mx
+        thresh = max(50, int(0.05 * w))
+        return clip_top, cnt, xmin, xmax, thresh
+
+    def _formula_bottom(ftop, scan_top, cnt, thresh, band_bot):
+        """自公式顶向下：连续 >=3 行密集=正文段，其顶即公式底；内容空隙 >=6pt 则停。"""
+        dense_run = 0
+        prev = None
+        for yy in range(len(cnt)):
+            y = yy / 2.0 + scan_top
+            if y <= ftop:
+                continue
+            if cnt[yy] >= thresh:
+                dense_run += 1
+                if dense_run >= 3:
+                    return y - (dense_run - 1) / 2.0
+            else:
+                if dense_run:
+                    dense_run = 0
+                elif cnt[yy] > 0:
+                    if prev is not None and y - prev >= 6:
+                        return prev + 1.0
+                    prev = y
+        last = None
+        for yy in range(len(cnt) - 1, -1, -1):
+            if cnt[yy] > 0:
+                last = yy / 2.0 + scan_top
+                break
+        return min(last + 1.0 if last else ftop + 40.0, band_bot)
+
+    def _crop(ftop, fbot, scan_top, cnt, xmin, xmax):
+        xs = []
+        for yy in range(len(cnt)):
+            if xmin[yy] is not None and ftop - 3 <= yy / 2.0 + scan_top <= fbot + 3:
+                xs.append(xmin[yy])
+                xs.append(xmax[yy])
+        if not xs:
+            return None
+        return pymupdf.Rect(min(xs) / 2.0 - 8.0, ftop - 4.0, max(xs) / 2.0 + 10.0, fbot + 4.0)
+
+    # 1) 锚点定位：md 公式前文本尾行，逐步缩短后缀 search_for（多命中取离 bbox 近的）
+    anchor_bot = None
+    btop = bbox.y0
+    tail = (md_before or "").strip().split("\n")[-1]
+    norm = re.sub(r"[\s\u00a0]+", "", tail)
+    for ln in range(min(len(norm), 24), 7, -1):
+        hits = page.search_for(norm[-ln:])
+        if hits:
+            hits = sorted(hits, key=lambda r: abs((r.y0 + r.y1) / 2 - (btop + 110.0)))
+            anchor_bot = hits[0].y1
+            break
+    if anchor_bot is not None:
+        scan_top = max(0.0, anchor_bot - 4.0)
+        scan_bot = min(page.rect.height, anchor_bot + 70.0)
+        scan_top, cnt, xmin, xmax, thresh = _scan_band(scan_top, scan_bot)
+        ftop = None
+        for yy in range(len(cnt)):
+            if cnt[yy] > 0 and yy / 2.0 + scan_top > anchor_bot + 0.5:
+                ftop = yy / 2.0 + scan_top
+                break
+        if ftop is not None:
+            fbot = _formula_bottom(ftop, scan_top, cnt, thresh, scan_bot)
+            crop = _crop(ftop, fbot, scan_top, cnt, xmin, xmax)
+            if crop is not None:
+                return crop
+
+    # 2) 兜底：bbox 下方扫稀疏公式带（公式实测位于 bbox 下 ~110pt）
+    scan_top = max(0.0, btop - 20.0)
+    scan_bot = min(page.rect.height, btop + 170.0)
+    scan_top, cnt, xmin, xmax, thresh = _scan_band(scan_top, scan_bot)
+    runs = []
+    cur = None
+    for yy in range(len(cnt)):
+        if cnt[yy] > 0:
+            if cur is None:
+                cur = [yy, yy]
+            elif yy - cur[1] > 8:
+                runs.append(cur)
+                cur = [yy, yy]
+            else:
+                cur[1] = yy
+        elif cur is not None:
+            runs.append(cur)
+            cur = None
+    if cur:
+        runs.append(cur)
+    best = None
+    for s, e in runs:
+        y0p = s / 2.0 + scan_top
+        y1p = e / 2.0 + scan_top
+        if y1p - y0p < 8:
+            continue
+        score = abs((y0p - btop) - 110.0)
+        if best is None or score < best[0]:
+            best = (score, y0p, y1p)
+    if best:
+        crop = _crop(best[1], best[2], scan_top, cnt, xmin, xmax)
+        if crop is not None:
+            return crop
+    return None
+
 
 @dataclass
 class DocMetadata:
@@ -145,18 +306,31 @@ class IngestionPipeline:
         """返回 doc_id"""
         doc_id = hashlib.md5(meta.doc_name.encode()).hexdigest()[:16]
 
-        # 1. parse — MinerU 返回 (md_text, pages, images_dict)
-        md_text, pages, images = await self.parser.parse(file_path)
+        # 1. parse — MinerU 返回 (md_text, pages, images_dict, table_blocks, equation_blocks)
+        (md_text, pages, images, table_blocks, equation_blocks) = (
+            await self.parser.parse(
+                file_path,
+                return_content_list=(
+                    settings.TABLE_ORIGINALS_ENABLED or settings.FORMULA_IMAGE_ENABLED
+                ),
+            )
+        )
         if not md_text or len(md_text.strip()) < 10:
             logger.error(f"文档解析后无内容: {meta.doc_name}")
             return doc_id
 
-        # ★ 公式原图对照（双通道）：额外 formula_enable=false 解析取公式原图，
-        #   VL 读出公式内容后嵌入 markdown，防 LaTeX 识别不准确
-        if settings.FORMULA_IMAGE_ENABLED:
-            formula_images = await self._collect_formula_images(file_path, images)
-            md_text = await self._embed_formula_images(
-                md_text, formula_images, doc_id, meta.doc_name,
+        # ★ 公式原图对照（bbox 裁剪）：content_list 的 equation 块带 bbox，
+        #   渲染页面裁剪出公式原图嵌入对应公式下方，防 LaTeX 识别不准确
+        if settings.FORMULA_IMAGE_ENABLED and equation_blocks:
+            md_text = await self._embed_formula_originals(
+                md_text, equation_blocks, file_path, doc_id, meta.doc_name,
+            )
+
+        # ★ 表格原图对照（bbox 裁剪）：渲染页面裁剪出表格原图嵌入对应表格下方，
+        #   防复杂表格（colspan/rowspan）OCR 串行/丢列；跨页表格续页块归并到主块
+        if settings.TABLE_ORIGINALS_ENABLED and table_blocks:
+            md_text = await self._embed_table_originals(
+                md_text, table_blocks, file_path, doc_id, meta.doc_name,
             )
 
         # ★ 上传图片到 MinIO，替换 markdown 引用为 MinIO URL
@@ -230,132 +404,253 @@ class IngestionPipeline:
 
         return doc_id
 
-    async def _collect_formula_images(
-        self, file_path: str, natural_images: dict[str, bytes],
-    ) -> list[tuple[str, bytes]]:
-        """第二遍解析（formula_enable=false）取公式原图。
+    # ============================================================
+    # 公式原图对照（bbox 裁剪）
+    # ============================================================
 
-        MinerU formula_enable=false 时公式输出为原图，自然图两遍都会出现。
-        公式图 = 第二遍 images 中内容哈希不在第一遍（自然图）集合里的图，
-        并按第二遍 markdown 引用顺序排序，保证与公式位置一一对应。
-        fail-open：第二遍解析失败返回空列表，不影响主通道入库。"""
-        try:
-            md2, _pages2, images2 = await self.parser.parse(
-                file_path, formula_enable=False,
-            )
-        except Exception as e:
-            logger.warning(f"公式原图通道解析失败（跳过）: {e}")
-            return []
-
-        if not images2:
-            return []
-
-        natural_hashes = {
-            hashlib.sha256(b).hexdigest() for b in natural_images.values()
-        }
-        ordered: list[tuple[str, bytes]] = []
-        seen: set[str] = set()
-        for ref in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", md2):
-            key = ref
-            img_bytes = images2.get(key)
-            if img_bytes is None and key.startswith("images/"):
-                img_bytes = images2.get(key[len("images/"):])
-            if img_bytes is None:
-                continue
-            digest = hashlib.sha256(img_bytes).hexdigest()
-            if digest in natural_hashes:
-                continue  # 自然图（两遍都出现），非公式
-            if digest in seen:
-                continue
-            seen.add(digest)
-            ordered.append((key, img_bytes))
-        return ordered
-
-    async def _embed_formula_images(
-        self, md_text: str, formula_images: list[tuple[str, bytes]],
-        doc_id: str, doc_name: str,
+    async def _embed_formula_originals(
+        self, md_text: str, equation_blocks: list[dict],
+        file_path: str, doc_id: str, doc_name: str,
     ) -> str:
-        """公式原图上传 MinIO + VL 读出公式内容，紧贴对应 $$..$$ 公式下方。
+        """公式原图嵌入 markdown：渲染页面 + bbox 裁剪公式原图，嵌到对应公式下方。
 
-        对齐规则：两遍解析均保持文档顺序，公式 token（行内 $..$ + 行间 $$..$$）
-        与公式原图一一对应；仅行间公式嵌入原图。
-        数量不匹配时（行内公式导致错位）退化为文末『公式原图对照』附录，保证原图不丢。
-        fail-open：上传/VL 失败只跳过单张，不阻塞入库。"""
-        if not formula_images:
+        MinerU content_list 的 equation 块携带完整 LaTeX（$$..$$）+ bbox + page_idx。
+        匹配规则：归一化 LaTeX（去空白）与 md 中行间公式 token 按文档顺序一一对应，
+        找到后在该公式后插入原图引用；匹配不上的块走文末『公式原图（识别对照）』附录。
+        fail-open：裁剪/上传失败只跳过单块，不阻塞入库。"""
+        if not equation_blocks:
             return md_text
 
-        # 1) 上传 MinIO + VL 读出公式内容
-        refs: list[str] = []
-        for img_key, img_bytes in formula_images:
-            base_name = img_key.rsplit("/", 1)[-1] or "formula.png"
-            ext = base_name.rsplit(".", 1)[-1].lower() if "." in base_name else "png"
-            content_type = {
-                "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
-            }.get(ext, "image/png")
-            object_name = f"images/{doc_id}/formula/{base_name}"
-            try:
-                upload_file(object_name, img_bytes, content_type=content_type)
-            except Exception as e:
-                logger.error(f"公式原图上传 MinIO 失败 {object_name}: {e}")
+        ordered = sorted(
+            equation_blocks,
+            key=lambda b: (
+                int(b.get("page_idx", 0) or 0),
+                (b.get("bbox") or [0, 0, 0, 0])[1],
+            ),
+        )
+        md_formulas = list(FORMULA_BLOCK_RE.finditer(md_text))
+
+        refs: list[tuple[int, int, str]] = []  # (start, end, ref)
+        appendix: list[str] = []
+        fi = 0
+        for block in ordered:
+            eq_norm = _normalize_formula(block.get("text"))
+            # 先按文档顺序匹配 md 行间公式 token：取公式前文本作锚点，
+            # 传给 _render_block_original 用“锚点+密度扫描”定位真实渲染区域
+            # （MinerU equation bbox 整体偏高 ~90-110pt，直接裁会裁到上方正文）
+            if eq_norm:
+                while fi < len(md_formulas) and _normalize_formula(
+                    md_formulas[fi].group(0)
+                ) != eq_norm:
+                    fi += 1
+            matched = fi < len(md_formulas)
+            md_before = md_text[: md_formulas[fi].start()] if matched else ""
+            ref = await self._render_block_original(
+                block, file_path, doc_id, doc_name,
+                kind="formula", md_before=md_before,
+            )
+            if not ref:
                 continue
+            if matched:
+                refs.append((md_formulas[fi].start(), md_formulas[fi].end(), ref))
+                fi += 1
+            else:
+                appendix.append(ref)
+
+        if not refs and not appendix:
+            return md_text
+
+        # 在对应公式后插入原图引用
+        out: list[str] = []
+        pos = 0
+        for start, end, ref in sorted(refs):
+            out.append(md_text[pos:end])
+            out.append(f"\n\n{ref}\n")
+            pos = end
+        out.append(md_text[pos:])
+        md_text = "".join(out)
+
+        if appendix:
+            md_text += "\n\n## 公式原图（识别对照）\n" + "\n\n".join(appendix)
+            logger.info(f"公式原图 {len(appendix)} 张无法定位，转文末附录: {doc_name}")
+
+        logger.info(f"公式原图嵌入完成 {len(refs)} 张（逐公式对照）: {doc_name}")
+        return md_text
+
+    # ============================================================
+    # 表格原图对照（bbox 裁剪）
+    # ============================================================
+
+    async def _embed_table_originals(
+        self, md_text: str, table_blocks: list[dict],
+        file_path: str, doc_id: str, doc_name: str,
+    ) -> str:
+        """表格原图嵌入 markdown：渲染页面 + bbox 裁剪表格原图，嵌到对应 </table> 后。
+
+        跨页表格结构（实测 MinerU 3.4.4）：
+          - 主块携带合并后的完整 table_body HTML + 首页 bbox
+          - 每个续页块 table_body=None，仅带该页 bbox
+        匹配规则：主块按文档顺序与 md 中 <table> 一一对应（归一化 body 子串校验）；
+          续页块裁剪图归并到最近的已匹配主块，多张图一起嵌到那一个 </table> 后。
+        fail-open：裁剪/上传失败只跳过单块；无法匹配到 md 表格的块走文末
+          『表格原图（识别对照）』附录，保证原图不丢。"""
+        if not table_blocks:
+            return md_text
+
+        md_tables = list(TABLE_HTML_RE.finditer(md_text))
+
+        # 1) 按文档顺序排所有表格块，逐块匹配
+        ordered = sorted(
+            table_blocks,
+            key=lambda b: (
+                int(b.get("page_idx", 0) or 0),
+                (b.get("bbox") or [0, 0, 0, 0])[1],
+            ),
+        )
+        table_images: dict[int, list[str]] = {}  # md table 索引 -> 图片引用
+        appendix: list[str] = []
+        t_idx = 0
+        last_matched: int | None = None
+
+        for block in ordered:
+            bbox = block.get("bbox")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            img_ref = await self._render_block_original(
+                block, file_path, doc_id, doc_name, kind="table",
+            )
+            if not img_ref:
+                continue
+
+            body = block.get("table_body")
+            if body:
+                body_norm = _normalize_table_html(body)
+                while (
+                    t_idx < len(md_tables)
+                    and body_norm
+                    not in _normalize_table_html(md_tables[t_idx].group(0))
+                ):
+                    t_idx += 1
+                if t_idx < len(md_tables):
+                    last_matched = t_idx
+                    table_images.setdefault(t_idx, []).append(img_ref)
+                    t_idx += 1
+                else:
+                    last_matched = None
+                    appendix.append(img_ref)
+            else:
+                # 续页块（table_body=None）：归并到最近匹配的主块
+                if last_matched is not None:
+                    table_images.setdefault(last_matched, []).append(img_ref)
+                else:
+                    appendix.append(img_ref)
+
+        if not table_images and not appendix:
+            return md_text
+
+        # 2) 在 </table> 后插入对应图片引用
+        out: list[str] = []
+        pos = 0
+        for i, m in enumerate(md_tables):
+            out.append(md_text[pos:m.end()])
+            for ref in table_images.get(i, []):
+                out.append(f"\n\n{ref}\n")
+            pos = m.end()
+        out.append(md_text[pos:])
+        md_text = "".join(out)
+
+        # 3) 无法定位的块走文末附录
+        if appendix:
+            md_text += "\n\n## 表格原图（识别对照）\n" + "\n\n".join(appendix)
+            logger.info(f"表格原图 {len(appendix)} 张无法定位，转文末附录: {doc_name}")
+
+        logger.info(f"表格原图嵌入完成 {sum(len(v) for v in table_images.values())} 张: {doc_name}")
+        return md_text
+
+    async def _render_block_original(
+        self, block: dict, file_path: str, doc_id: str, doc_name: str,
+        kind: str = "table", md_before: str = "",
+    ) -> str | None:
+        """渲染 page_idx 页面，按归一化 bbox 裁剪表格/公式区域 → 上传 MinIO → 返回引用。
+
+        bbox 坐标系：MinerU 归一化（页面渲染宽度=842），换算到 PDF pt：
+          pt = norm * 页宽 / 842。
+        kind=table  （表格原图）：bbox 底部常裁掉最后一行（实测偏短 40~55pt），
+            用该区域文本块向下吸附，无文本层（扫描版）则用固定 60pt 下边距兜底；
+        kind=formula（公式原图）：MinerU equation bbox 整体偏高 ~90-110pt 且高度不可靠，
+            优先用 _locate_formula_rect（公式前文本锚点 + 渲染密度扫描）定位真实区域，
+            md_before 传公式前 markdown；定位失败退回 bbox 上下留白裁剪。
+        fail-open：pymupdf 缺失/裁剪异常返回 None，不阻塞入库。"""
+        import pymupdf  # 延迟导入，pymupdf 缺失时跳过原图
+
+        bbox = block.get("bbox")
+        page_idx = int(block.get("page_idx", 0) or 0)
+        try:
+            doc = pymupdf.open(file_path)
+            if page_idx < 0 or page_idx >= doc.page_count:
+                return None
+            page = doc[page_idx]
+
+            u2pt = page.rect.width / 842.0
+            x0, y0, x1, y1 = bbox
+            rect = pymupdf.Rect(
+                x0 * u2pt, y0 * u2pt, x1 * u2pt, y1 * u2pt,
+            )
+            if kind == "formula":
+                # 公式：优先用锚点+密度扫描定位真实渲染区域（bbox 偏高需修正）
+                crop = _locate_formula_rect(page, rect, md_before or "")
+                if crop is None:
+                    # 兜底：bbox 上下各留白（上标/下标），右侧兜底
+                    crop = pymupdf.Rect(
+                        rect.x0 - 6.0, rect.y0 - 14.0,
+                        rect.x1 + 20.0, rect.y1 + 18.0,
+                    )
+                padded = crop
+            else:
+                # 表格：底部固定 60pt 下边距（bbox 常裁掉最后一行）；右侧 +30pt 兜底
+                padded = pymupdf.Rect(
+                    rect.x0, rect.y0, rect.x1 + 30.0, rect.y1 + 60.0,
+                )
+                # 文本块向下吸附：扩展到该区域内最底部文本块，捕捉被裁掉的行
+                blocks = [
+                    b for b in page.get_text("blocks")
+                    if b[0] < padded.x1 and b[2] > padded.x0
+                    and b[1] < padded.y1 and b[3] > padded.y0
+                ]
+                if blocks:
+                    padded.y1 = max(padded.y1, max(b[3] for b in blocks))
+                    padded.x1 = max(padded.x1, max(b[2] for b in blocks))
+            padded &= page.rect
+            if padded.width < 20 or padded.height < 20:
+                return None
+
+            # 渲染裁剪区域（2x 缩放，保证原图清晰度）
+            scale = 2.0
+            pix = page.get_pixmap(
+                matrix=pymupdf.Matrix(scale, scale), clip=padded, alpha=False,
+            )
+            png_bytes = pix.tobytes("png")
+
+            object_name = (
+                f"images/{doc_id}/{kind}/"
+                f"p{page_idx}_{int(rect.y0)}_{int(rect.x0)}.png"
+            )
+            ensure_bucket_exists()
+            upload_file(object_name, png_bytes, content_type="image/png")
 
             scheme = "https" if settings.MINIO_SECURE else "http"
-            minio_url = f"{scheme}://{settings.MINIO_ENDPOINT}/{settings.MINIO_BUCKET}/{object_name}"
-
-            summary = ""
-            if settings.IMAGE_SUMMARIZE_ENABLED:
-                from src.rag.ingestion.image_summarizer import (
-                    FORMULA_PROMPT,
-                    summarize_image,
-                )
-                summary = await summarize_image(
-                    img_bytes, content_type, settings.VL_MODEL, prompt=FORMULA_PROMPT,
-                )
-            alt = f"公式原图：{summary}" if summary else "公式原图"
-            refs.append(f"![{alt}]({minio_url})")
-
-        if not refs:
-            return md_text
-
-        # 2) 公式 token 序列（行内 + 行间）与公式原图按文档顺序对齐
-        formula_pattern = re.compile(r"\$\$[\s\S]+?\$\$|\$[^$\n]+?\$")
-        formula_types = [
-            tok.startswith("$$") for tok in formula_pattern.findall(md_text)
-        ]
-
-        if len(formula_types) == len(refs):
-            # 逐公式嵌入：仅行间公式（$$..$$）后紧跟原图
-            parts: list[str] = []
-            last = 0
-            for m in formula_pattern.finditer(md_text):
-                parts.append(md_text[last:m.start()])
-                parts.append(m.group(0))  # 公式 token 单独成段
-                last = m.end()
-            parts.append(md_text[last:])
-
-            out: list[str] = []
-            fi = 0  # 全局公式序号（含行内），refs 与之按文档顺序一一对应
-            for idx, part in enumerate(parts):
-                out.append(part)
-                # 奇数索引 = 公式 token；仅行间公式（$$）在其后嵌入对应原图
-                if idx % 2 == 1:
-                    if part.startswith("$$") and fi < len(refs):
-                        out.append(f"\n\n{refs[fi]}\n")
-                    fi += 1
-            md_text = "".join(out)
-            logger.info(
-                f"公式原图嵌入完成 {len(refs)} 张（逐公式对照）: {doc_name}"
+            minio_url = (
+                f"{scheme}://{settings.MINIO_ENDPOINT}/"
+                f"{settings.MINIO_BUCKET}/{object_name}"
             )
-        else:
-            # 数量不匹配 → 文末附录，原图不丢
-            appendix = "\n\n## 公式原图（识别对照）\n" + "\n\n".join(refs)
-            md_text = md_text + appendix
-            logger.info(
-                f"公式原图 {len(refs)} 张与公式数 {len(formula_types)} 不匹配，"
-                f"转文末附录: {doc_name}"
+            alt = "表格原图" if kind == "table" else "公式原图"
+            return f"![{alt}]({minio_url})"
+        except Exception as e:
+            logger.error(
+                f"{'表格' if kind == 'table' else '公式'}原图裁剪/上传失败 "
+                f"{doc_name} page={page_idx}: {e}"
             )
-        return md_text
+            return None
 
     async def _upload_images_and_replace_refs(
         self, md_text: str, images: dict[str, bytes], doc_id: str, doc_name: str,

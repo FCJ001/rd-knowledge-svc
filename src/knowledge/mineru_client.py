@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import re
 from pathlib import Path
 
@@ -32,15 +33,19 @@ async def parse_document(
     backend: str | None = None,
     return_images: bool = True,
     formula_enable: bool = True,
-) -> tuple[str, list[int], dict[str, bytes]]:
+    return_content_list: bool = False,
+) -> tuple[str, list[int], dict[str, bytes], list[dict], list[dict]]:
     """
     调用 MinerU API 解析文档。
     优先使用异步接口（POST /tasks -> 轮询），超大文件不会阻塞。
-    Returns: (markdown_text, page_numbers_per_block, images_dict)
+    Returns: (markdown_text, page_numbers_per_block, images_dict, table_blocks, equation_blocks)
         images_dict: key=文件名, value=图片 bytes
+        table_blocks: return_content_list=True 时从 content_list 提取的表格块，
+            [{page_idx(0-based), bbox[x0,y0,x1,y1](归一化坐标系), table_body(HTML|None)}]
+        equation_blocks: 公式块 [{page_idx, bbox(归一化), text(LaTeX $$..$$)}]
 
-    formula_enable: True=公式输出 LaTeX 文本（可检索/可引用）；
-        False=公式输出为原图（保真对照用），用于双通道取公式原图。
+    formula_enable: True=公式输出 LaTeX 文本（可检索/可引用）。
+    return_content_list: True 时请求 content_list，用于表格/公式原图定位（bbox+页码）。
     """
     base_url = settings.MINERU_API_URL
     backend = backend or settings.MINERU_BACKEND
@@ -61,6 +66,7 @@ async def parse_document(
                 "return_images": str(return_images).lower(),
                 "formula_enable": str(formula_enable).lower(),
                 "table_enable": "true",
+                "return_content_list": str(return_content_list).lower(),
             },
         )
         resp.raise_for_status()
@@ -69,7 +75,10 @@ async def parse_document(
 
         if not task_id:
             logger.warning("MinerU 未返回 task_id，尝试同步解析")
-            return await _parse_sync(file_path, file_name, backend, return_images, formula_enable)
+            return await _parse_sync(
+                file_path, file_name, backend, return_images, formula_enable,
+                return_content_list,
+            )
 
         for _ in range(timeout // 2):
             await asyncio.sleep(2)
@@ -92,8 +101,8 @@ async def parse_document(
 
 async def _parse_sync(
     file_path: str, file_name: str, backend: str, return_images: bool = True,
-    formula_enable: bool = True,
-) -> tuple[str, list[int], dict[str, bytes]]:
+    formula_enable: bool = True, return_content_list: bool = False,
+) -> tuple[str, list[int], dict[str, bytes], list[dict], list[dict]]:
     """同步解析（兜底方案）"""
     base_url = settings.MINERU_API_URL
     file_bytes = Path(file_path).read_bytes()
@@ -108,18 +117,23 @@ async def _parse_sync(
                 "return_images": str(return_images).lower(),
                 "formula_enable": str(formula_enable).lower(),
                 "table_enable": "true",
+                "return_content_list": str(return_content_list).lower(),
             },
         )
         resp.raise_for_status()
         return _extract_result(resp.json())
 
 
-def _extract_result(result: dict) -> tuple[str, list[int], dict[str, bytes]]:
-    """从 MinerU 响应中提取 Markdown + 页码 + 图片（兼容新旧 API 格式）"""
+def _extract_result(
+    result: dict,
+) -> tuple[str, list[int], dict[str, bytes], list[dict], list[dict]]:
+    """从 MinerU 响应中提取 Markdown + 页码 + 图片 + 表格块 + 公式块（兼容新旧 API 格式）"""
     results = result.get("results", {})
     md = ""
     pages: list[int] = []
     images: dict[str, bytes] = {}
+    table_blocks: list[dict] = []
+    equation_blocks: list[dict] = []
 
     # v3.4.4+（protocol v2）: results 是 dict[str, dict]，key=文件名
     if isinstance(results, dict):
@@ -135,8 +149,11 @@ def _extract_result(result: dict) -> tuple[str, list[int], dict[str, bytes]]:
                                 images[img_name] = _decode_image(img_data)
                             except Exception as e:
                                 logger.warning(f"图片解码失败 {img_name}: {e}")
-                    return md, pages, images
-        return "", [], {}
+                    table_blocks, equation_blocks = _parse_content_list(
+                        file_data.get("content_list")
+                    )
+                    return md, pages, images, table_blocks, equation_blocks
+        return "", [], [], [], []
 
     # 旧版: results 是 list[dict]，有 md/blocks/images 字段
     if isinstance(results, list) and results:
@@ -152,16 +169,55 @@ def _extract_result(result: dict) -> tuple[str, list[int], dict[str, bytes]]:
                         images[img_name] = _decode_image(img_data)
                     except Exception as e:
                         logger.warning(f"图片解码失败 {img_name}: {e}")
-            return md, pages, images
+            return md, pages, images, [], []
 
     # 兜底: result 本身包含 md
     if "md" in result:
-        return result["md"], [], {}
+        return result["md"], [], [], [], []
     if "md_content" in result:
-        return result["md_content"], [], {}
+        return result["md_content"], [], [], [], []
 
-    import json
-    return json.dumps(result, ensure_ascii=False), [], {}
+    return json.dumps(result, ensure_ascii=False), [], [], [], []
+
+
+def _parse_content_list(raw) -> tuple[list[dict], list[dict]]:
+    """从 content_list（JSON 字符串或 list）提取表格块与公式块。
+
+    返回 (table_blocks, equation_blocks)
+    table_blocks: [{page_idx, bbox, table_body: str|None}]
+        table_body=None 表示该块表格 HTML 解析失败——实测跨页表格的续页块
+        就是 body=None（被 MinerU 合并进前一块的 <table>）。
+    equation_blocks: [{page_idx, bbox, text(LaTeX $$..$$)}]
+        type=equation 的块，bbox 与表格同一归一化坐标系，text 是完整公式文本。"""
+    if not raw:
+        return [], []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return [], []
+    tables: list[dict] = []
+    equations: list[dict] = []
+    for b in raw if isinstance(raw, list) else []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "table":
+            tables.append(
+                {
+                    "page_idx": int(b.get("page_idx", 0) or 0),
+                    "bbox": b.get("bbox"),
+                    "table_body": b.get("table_body"),
+                }
+            )
+        elif b.get("type") == "equation":
+            equations.append(
+                {
+                    "page_idx": int(b.get("page_idx", 0) or 0),
+                    "bbox": b.get("bbox"),
+                    "text": b.get("text"),
+                }
+            )
+    return tables, equations
 
 
 def _decode_image(img_data) -> bytes:

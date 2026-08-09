@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     # 防 LaTeX OCR 识别不准确。代价：解析时间约 2 倍（异步 worker 可接受）。
     FORMULA_IMAGE_ENABLED: bool = True
 
+    # ---------------- 表格原图对照（bbox 裁剪）----------------
+    # MinerU content_list 返回表格 bbox + page_idx，用 PyMuPDF 渲染对应页裁剪出表格原图，
+    # 嵌入 markdown 表格下方供人眼对照，防复杂表格（colspan/rowspan）OCR 串行/丢列。
+    # 跨页表格每个页片段一块，续页块（table_body=None）归并到上一块。
+    TABLE_ORIGINALS_ENABLED: bool = True
+
     # ---------------- API 限流 ----------------
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_BACKEND: str = "redis"     # redis（ZSET 跨 worker）/ memory（进程内 deque）
