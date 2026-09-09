@@ -77,16 +77,31 @@ class TrackedRAG:
             return [json.dumps(r, ensure_ascii=False) for r in records] if records else []
 
         elif self.channel == "nl2sql":
-            from src.nl2sql.engine import search_sql_raw
+            # ★ NL2SQL 已迁移到 rd-chatBI 服务，走 HTTP 通道
+            import httpx
 
-            if not self.db_session:
-                return ["数据库连接不可用"]
-            data, sql = await search_sql_raw(
-                query, self.llm, self.db_session, role=self.role,
-            )
-            contexts = [f"[SQL] {sql}"]
-            contexts.extend([json.dumps(d, ensure_ascii=False) for d in data[:10]])
-            return contexts
+            from src.core.config import get_settings
+
+            settings = get_settings()
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{settings.CHATBI_URL}/api/v1/bi/query",
+                    json={"question": query, "session_id": "eval", "with_chart": False},
+                    headers={
+                        "X-User-Id": "knowledge-svc",
+                        "X-User-Role": self.role,
+                        "X-Project-Id": settings.BI_PROJECT_ID if hasattr(settings, "BI_PROJECT_ID") else settings.CHATBI_PROJECT_ID,
+                    },
+                )
+                data = (resp.json().get("data") or {})
+                if not data.get("success"):
+                    return [f"查询失败: {data.get('error', 'unknown')}"]
+                contexts = [f"[SQL] {data.get('sql', '')}"]
+                contexts.extend(
+                    json.dumps(d, ensure_ascii=False, default=str)
+                    for d in (data.get("data") or [])[:10]
+                )
+                return contexts
 
         elif self.channel == "fusion":
             import asyncio

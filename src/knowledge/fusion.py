@@ -1,6 +1,8 @@
 # ============================================================
 # 多通道融合检索：doc + graph [+ nl2sql] 并行 → 融合 → 幻觉检测
 # ★ return_exceptions=True：单通道失败不拖垮全局
+# ★ nl2sql 通道已迁移到 rd-chatBI 服务，本服务通过 HTTP 调用，
+#   通道返回数据摘要文本（与旧 engine.search_sql 同构），融合逻辑不变
 # ============================================================
 
 from __future__ import annotations
@@ -10,13 +12,13 @@ import json
 import re
 from collections.abc import Callable
 
+import httpx
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 from loguru import logger
 from neo4j import AsyncDriver
 from pymilvus import MilvusClient
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import get_settings
 from src.core.metrics import RETRIEVAL_REQUESTS
@@ -27,6 +29,46 @@ from src.knowledge.hallucination_check import check_hallucination
 from src.knowledge.prompts import FUSION_PROMPT
 
 _settings = get_settings()
+
+
+def _chatbi_headers(
+    role: str, owner_domain_id: int | None, business_line: str | None
+) -> dict:
+    """ChatBI 请求头：身份 + 行级过滤参数 + 数据源路由"""
+    headers = {
+        "X-User-Id": "knowledge-svc",
+        "X-User-Role": role,
+        "X-Project-Id": _settings.CHATBI_PROJECT_ID,
+    }
+    if owner_domain_id is not None:
+        headers["X-Owner-Domain-Id"] = str(owner_domain_id)
+    if business_line:
+        headers["X-Business-Line"] = business_line
+    return headers
+
+
+async def _search_chatbi(
+    question: str,
+    role: str = "admin",
+    session_id: str = "default",
+    owner_domain_id: int | None = None,
+    business_line: str | None = None,
+) -> str:
+    """ChatBI 通道：HTTP 调 rd-chatBI，返回数据摘要文本。
+
+    失败抛异常 → 交给 _run_channel 的重试/熔断/超时三层保护处理。
+    只取 summary（图表/表格由前端直连 rd-chatBI，不经过 fusion）。"""
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{_settings.CHATBI_URL}/api/v1/bi/query",
+            json={"question": question, "session_id": session_id, "with_chart": False},
+            headers=_chatbi_headers(role, owner_domain_id, business_line),
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data") or {}
+        if not data.get("success"):
+            raise RuntimeError(data.get("error") or "chatbi 查询失败")
+        return data.get("summary") or "（无数据）"
 
 
 def _emit(event_sink: Callable[[dict], None] | None, msg: dict) -> None:
@@ -123,15 +165,18 @@ async def multi_channel_search(
     embedding_model: Embeddings,
     milvus_client: MilvusClient,
     neo4j_driver: AsyncDriver,
-    db_session: AsyncSession | None = None,
     channels: list[str] | None = None,
-    role: str = "engineer",
+    role: str = "admin",
     use_hyde: bool = False,
+    session_id: str = "default",
+    owner_domain_id: int | None = None,
+    business_line: str | None = None,
     event_sink: Callable[[dict], None] | None = None,
 ) -> dict:
     """
     多通道并行检索 → 结果融合 → 幻觉检测 → 返回 {"answer": str, "contexts": list[str]}。
 
+    nl2sql 通道通过 HTTP 调 rd-chatBI（CHATBI_URL），失败自动降级。
     event_sink: 可选回调，推流式事件：检索进度 {"type":"progress",...}、
     答案 token {"type":"delta",...}、结束 {"type":"done",...}。
     """
@@ -147,9 +192,11 @@ async def multi_channel_search(
         )
     if "graph_rag" in channels:
         tasks["graph_rag"] = lambda: search_graph_raw(question, neo4j_driver, llm)
-    if "nl2sql" in channels and db_session:
-        from src.nl2sql.engine import search_sql
-        tasks["nl2sql"] = lambda: search_sql(question, llm, db_session)
+    if "nl2sql" in channels:
+        tasks["nl2sql"] = lambda: _search_chatbi(
+            question, role=role, session_id=session_id,
+            owner_domain_id=owner_domain_id, business_line=business_line,
+        )
 
     logger.info(f"多通道检索开始: channels={list(tasks.keys())}")
 

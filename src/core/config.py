@@ -108,10 +108,9 @@ class Settings(BaseSettings):
     CIRCUIT_FAILURE_THRESHOLD: int = 5    # 熔断阈值：连续失败 N 次打开熔断器
     CIRCUIT_RESET_TIMEOUT: int = 30       # 熔断复位窗口（秒），过后放一个探针
 
-    # ---------------- NL2SQL（查项目一业务库 rd_agent）----------------
-    ALM_DB_USER: str = "rdagent"
-    ALM_DB_PASSWORD: str = "rdagent123"
-    ALM_DB_NAME: str = "rd_agent"
+    # ---------------- ChatBI（nl2sql 通道走独立服务）----------------
+    CHATBI_URL: str = "http://localhost:8004"
+    CHATBI_PROJECT_ID: str = "rd_agent"  # 多数据源路由（bi_datasources.code）
 
     # ---------------- TruLens ----------------
     TRULENS_ENABLED: bool = True
@@ -142,14 +141,6 @@ class Settings(BaseSettings):
         return (
             f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
-        )
-
-    @property
-    def ALM_DATABASE_URL(self) -> str:
-        """项目一业务库 rd_agent（NL2SQL 查询目标，只读）"""
-        return (
-            f"postgresql+asyncpg://{self.ALM_DB_USER}:{self.ALM_DB_PASSWORD}"
-            f"@{self.DB_HOST}:{self.DB_PORT}/{self.ALM_DB_NAME}"
         )
 
     @property

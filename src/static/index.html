@@ -848,7 +848,7 @@ async function doBIQuery() {
 
   // 尝试 SSE 流式查询，失败则降级到旧接口
   try {
-    const resp = await fetch(BASE+'/api/v1/bi/query-stream',{
+    const resp = await fetch(CHATBI_BASE+'/api/v1/bi/query-stream',{
       method:'POST',
       headers:{'Content-Type':'application/json','X-User-Id':'web','X-User-Role':store.role},
       body: JSON.stringify({question:q, session_id:store.biSession, with_chart:true})
@@ -929,7 +929,7 @@ async function doBIQuery() {
   } catch(e) {
     // 降级到旧接口
     try {
-      const resp = await fetch(BASE+'/api/v1/bi/query',{
+      const resp = await fetch(CHATBI_BASE+'/api/v1/bi/query',{
         method:'POST',
         headers:{'Content-Type':'application/json','X-User-Id':'web','X-User-Role':store.role},
         body: JSON.stringify({question:q, session_id:store.biSession, with_chart:true})
@@ -1042,7 +1042,7 @@ function rerunBI(idx) {
 async function clearBIHistory() {
   const sid = document.getElementById('biSessionId').value;
   try {
-    await fetch(BASE+'/api/v1/bi/history/'+sid,{method:'DELETE',headers:{'X-User-Id':'web','X-User-Role':store.role}});
+    await fetch(CHATBI_BASE+'/api/v1/bi/history/'+sid,{method:'DELETE',headers:{'X-User-Id':'web','X-User-Role':store.role}});
     toast('会话历史已清除', 'success');
   } catch(e) { toast('清除失败', 'error'); }
 }

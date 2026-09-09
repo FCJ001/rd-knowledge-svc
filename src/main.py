@@ -51,13 +51,11 @@ register_exception_handlers(app)
 # ── 注册路由 ────────────────────────────────────────────────────────────
 
 from src.api.routers.knowledge import router as knowledge_router
-from src.api.routers.bi import router as bi_router
 from src.api.routers.ingest import router as ingest_router
 from src.api.routers.eval import router as eval_router
 from src.api.routers.feedback import router as feedback_router
 
 app.include_router(knowledge_router)
-app.include_router(bi_router)
 app.include_router(ingest_router)
 app.include_router(eval_router)
 app.include_router(feedback_router)

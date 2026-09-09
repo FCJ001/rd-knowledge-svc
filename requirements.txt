@@ -3,7 +3,6 @@
 #
 # 与项目一 rd-agent-platform 保持版本一致，已验证跑通。
 # 项目二不做 Agent，去掉 langgraph-checkpoint-redis。
-# 新增：sqlglot（AST 层 SQL 注入）、trulens（评测）、aiohttp（MinerU 轮询）
 # ============================================================
 
 # ---------------- Web 框架 ----------------
@@ -61,13 +60,11 @@ pypdf==6.10.0
 pandas==2.3.3
 
 # ---------------- NL2SQL（AST 层 SQL 注入）----------------
-sqlglot==26.17.0
 
 # ---------------- 评测（TruLens）----------------
 trulens>=2.9.0
 
 # ---------------- NL2SQL RAG 流水线 ----------------
-jieba==0.42.1
 elasticsearch==8.15.1
 pyyaml==6.0.2
 
