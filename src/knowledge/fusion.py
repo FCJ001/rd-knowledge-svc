@@ -27,6 +27,7 @@ from src.knowledge.doc_rag import extract_image_urls, format_doc_context, search
 from src.knowledge.graph_rag import search_graph_raw
 from src.knowledge.hallucination_check import check_hallucination
 from src.knowledge.prompts import FUSION_PROMPT
+from src.knowledge.query_rewriter import rewrite_query
 
 _settings = get_settings()
 
@@ -74,6 +75,54 @@ async def _search_chatbi(
 def _emit(event_sink: Callable[[dict], None] | None, msg: dict) -> None:
     if event_sink is not None:
         event_sink(msg)
+
+
+async def _rewrite_question(
+    question: str,
+    llm: BaseChatModel,
+    role: str,
+    event_sink: Callable[[dict], None] | None,
+) -> dict:
+    """主链路第一步：Query 改写（口语→专业术语 + 子查询拆分）。
+
+    - 受 QUERY_REWRITE_ENABLED 开关与 QUERY_REWRITE_TIMEOUT 超时双重保护，
+      失败/超时一律降级为原问题 —— 改写是增强项，不能成为新的故障点；
+    - 改写结果通过 event_sink 推给前端（进度事件 channel=query_rewrite），
+      并写入日志供离线评测对照改写前后召回差异。"""
+    if not _settings.QUERY_REWRITE_ENABLED:
+        return {"queries": [question], "intent": "knowledge_qa"}
+
+    try:
+        rewritten = await asyncio.wait_for(
+            rewrite_query(question, llm, role=role),
+            timeout=_settings.QUERY_REWRITE_TIMEOUT,
+        )
+        queries = [q for q in rewritten.get("queries", []) if q][: _settings.QUERY_REWRITE_MAX_SUB_QUERIES]
+        if not queries:
+            raise ValueError("改写结果为空")
+        rewritten["queries"] = queries
+        logger.info(f"Query 改写完成: {question[:40]} → {queries} intent={rewritten.get('intent')}")
+        _emit(event_sink, {
+            "type": "progress", "channel": "query_rewrite", "status": "ok",
+            "queries": queries, "intent": rewritten.get("intent", ""),
+        })
+        return rewritten
+    except Exception as e:
+        logger.warning(f"Query 改写失败，使用原始问题: {e}")
+        _emit(event_sink, {"type": "progress", "channel": "query_rewrite", "status": "failed"})
+        return {"queries": [question], "intent": "knowledge_qa"}
+
+
+def _merge_doc_hits(hit_lists: list[list[dict]], limit: int) -> list[dict]:
+    """多个子查询的文档命中按 id 去重（保留高分那条），按分数降序截断。"""
+    best: dict[str, dict] = {}
+    for hits in hit_lists:
+        for hit in hits or []:
+            key = str(hit.get("id") or hit.get("chunk_id") or hit.get("text", ""))[:256]
+            if key not in best or (hit.get("score") or 0) > (best[key].get("score") or 0):
+                best[key] = hit
+    merged = sorted(best.values(), key=lambda h: h.get("score") or 0, reverse=True)
+    return merged[:limit]
 
 
 async def _run_channel(key: str, factory: Callable[[], object]) -> object:
@@ -176,6 +225,9 @@ async def multi_channel_search(
     """
     多通道并行检索 → 结果融合 → 幻觉检测 → 返回 {"answer": str, "contexts": list[str]}。
 
+    主链路第一步做 Query 改写（_rewrite_question）：主查询喂给全部通道，
+    拆分出的子查询额外走 doc_rag 并合并命中（子查询只增强文档召回，
+    图谱/nl2sql 通道保持单查询 —— 多子查询会让通道成本翻倍）。
     nl2sql 通道通过 HTTP 调 rd-chatBI（CHATBI_URL），失败自动降级。
     event_sink: 可选回调，推流式事件：检索进度 {"type":"progress",...}、
     答案 token {"type":"delta",...}、结束 {"type":"done",...}。
@@ -183,18 +235,31 @@ async def multi_channel_search(
     if channels is None:
         channels = ["doc_rag", "graph_rag"]
 
+    # ── Query 改写（口语→术语 + 子查询拆分，失败降级原问题）──
+    rewritten = await _rewrite_question(question, llm, role, event_sink)
+    queries = rewritten["queries"]
+    query = queries[0]
+
     # 通道用"工厂函数"而非协程：失败重试时可以重新执行
     tasks: dict[str, Callable[[], object]] = {}
     if "doc_rag" in channels:
-        tasks["doc_rag"] = lambda: search_docs_raw(
-            question, embedding_model, milvus_client,
-            llm=llm, use_hyde=use_hyde,
-        )
+        async def _doc_channel():
+            # 主查询 + 其余子查询并行召回，合并去重（增强子问题的文档覆盖）
+            hit_lists = await asyncio.gather(*[
+                search_docs_raw(
+                    q, embedding_model, milvus_client,
+                    llm=llm, use_hyde=use_hyde,
+                )
+                for q in queries
+            ])
+            return _merge_doc_hits(hit_lists, limit=20)
+
+        tasks["doc_rag"] = _doc_channel
     if "graph_rag" in channels:
-        tasks["graph_rag"] = lambda: search_graph_raw(question, neo4j_driver, llm)
+        tasks["graph_rag"] = lambda: search_graph_raw(query, neo4j_driver, llm)
     if "nl2sql" in channels:
         tasks["nl2sql"] = lambda: _search_chatbi(
-            question, role=role, session_id=session_id,
+            query, role=role, session_id=session_id,
             owner_domain_id=owner_domain_id, business_line=business_line,
         )
 

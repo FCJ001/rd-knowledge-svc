@@ -27,3 +27,8 @@ _redis_client = redis.Redis(connection_pool=redis_pool)
 async def get_redis_client() -> redis.Redis:
     """FastAPI Depends 注入用"""
     return _redis_client
+
+
+def get_redis_sync_client() -> redis.Redis:
+    """非 Depends 场景（韧性层熔断状态等）直接拿共享连接池的客户端"""
+    return _redis_client

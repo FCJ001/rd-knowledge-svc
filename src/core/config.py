@@ -107,6 +107,12 @@ class Settings(BaseSettings):
     RETRIEVAL_CHANNEL_RETRIES: int = 2    # 通道临时失败重试次数（指数退避）
     CIRCUIT_FAILURE_THRESHOLD: int = 5    # 熔断阈值：连续失败 N 次打开熔断器
     CIRCUIT_RESET_TIMEOUT: int = 30       # 熔断复位窗口（秒），过后放一个探针
+    CIRCUIT_REDIS_ENABLED: bool = True    # 熔断状态外置 Redis（多副本共享；Redis 异常自动降级进程内）
+
+    # ---------------- Query 改写（检索主链路第一步）----------------
+    QUERY_REWRITE_ENABLED: bool = True    # 口语→术语 + 子查询拆分，失败降级原问题
+    QUERY_REWRITE_TIMEOUT: float = 8.0    # 改写 LLM 调用超时（秒）
+    QUERY_REWRITE_MAX_SUB_QUERIES: int = 3  # 子查询数量上限（防 LLM 拆分失控放大召回成本）
 
     # ---------------- ChatBI（nl2sql 通道走独立服务）----------------
     CHATBI_URL: str = "http://localhost:8004"
