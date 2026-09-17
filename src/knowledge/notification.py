@@ -5,8 +5,8 @@
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.knowledge.model import KnowledgeNotification
 from src.core.logger import logger
+from src.knowledge.model import KnowledgeNotification
 
 
 async def notify_doc_update(
@@ -32,7 +32,7 @@ async def notify_doc_update(
 async def get_unread_notifications(db: AsyncSession) -> list[KnowledgeNotification]:
     result = await db.execute(
         select(KnowledgeNotification)
-        .where(KnowledgeNotification.is_read == False)
+        .where(KnowledgeNotification.is_read.is_(False))
         .order_by(desc(KnowledgeNotification.created_at))
     )
     return list(result.scalars().all())

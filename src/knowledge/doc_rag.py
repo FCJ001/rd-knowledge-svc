@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
@@ -71,13 +73,15 @@ async def search_docs_raw(
         # 降级：RRF 混合检索失败 → 回退旧 dense-only 检索，再失败返回 []
         logger.warning(f"混合检索失败，降级为 dense-only: {e}")
         try:
+            from src.infra.milvus_client import escape_milvus_string
             filter_parts = []
             if doc_type:
-                filter_parts.append(f'doc_type == "{doc_type}"')
+                filter_parts.append(f'doc_type == "{escape_milvus_string(doc_type)}"')
             if model_code:
-                filter_parts.append(f'model_code == "{model_code}"')  # ★
+                filter_parts.append(f'model_code == "{escape_milvus_string(model_code)}"')
             filter_expr = " and ".join(filter_parts) if filter_parts else None
-            results = milvus_client.search(
+            results = await asyncio.to_thread(
+                milvus_client.search,
                 collection_name=COLLECTION_NAME,
                 data=[query_vec],
                 limit=top_k,

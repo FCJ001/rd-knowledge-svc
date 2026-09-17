@@ -7,9 +7,8 @@
 
 import asyncio
 
-import pytest
 import pymupdf
-
+import pytest
 from src.rag.ingestion import pipeline as pipe_mod
 
 

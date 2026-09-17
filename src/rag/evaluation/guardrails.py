@@ -18,7 +18,6 @@ import re
 
 from src.core.config import get_settings
 
-
 # ── SQL 危险操作模式 ─────────────────────────────────────────────────────
 
 _DDL_PATTERNS = [

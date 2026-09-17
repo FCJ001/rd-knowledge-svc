@@ -2,9 +2,10 @@
 # 通用 CRUD Repository（仿 MyBatis BaseMapper）
 # ============================================================
 
-from typing import TypeVar, Generic, Type, Sequence
+from collections.abc import Sequence
+from typing import Generic, TypeVar
 
-from sqlalchemy import select, delete, or_, func
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.base_model import BaseModel
@@ -13,7 +14,7 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class BaseRepository(Generic[T]):
-    def __init__(self, model: Type[T], db: AsyncSession):
+    def __init__(self, model: type[T], db: AsyncSession):
         self.model = model
         self.db = db
 
@@ -50,8 +51,18 @@ class BaseRepository(Generic[T]):
         limit: int = 20,
         keyword: str | None = None,
         search_fields: list[str] | None = None,
+        status: str | None = None,
+        exclude: bool = False,
     ) -> tuple[list[T], int]:
+        """分页查询。
+
+        status + exclude：exclude=False 只查该状态；exclude=True 排除该状态
+        （如列表页排除 status=deleted 的软删文档）。"""
         stmt = select(self.model)
+
+        if status is not None and hasattr(self.model, "status"):
+            column = self.model.status
+            stmt = stmt.where(column != status) if exclude else stmt.where(column == status)
 
         if keyword and search_fields:
             conditions = []

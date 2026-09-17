@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from loguru import logger
 
 from src.core.config import get_settings
@@ -78,12 +80,18 @@ async def rerank_docs(
         dashscope.api_key = settings.DASHSCOPE_API_KEY
         texts = [doc.get("text", "") for doc in documents]
 
-        response = TextReRank.call(
-            model="qwen3-rerank",
-            query=query,
-            documents=texts,
-            top_n=rerank_top_n,
-            return_documents=False,
+        # ★ dashscope 是同步 HTTP 客户端：to_thread 下放 + 整体超时，
+        #   否则一次精排挂起就冻结事件循环数秒~数十秒
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                TextReRank.call,
+                model="qwen3-rerank",
+                query=query,
+                documents=texts,
+                top_n=rerank_top_n,
+                return_documents=False,
+            ),
+            timeout=settings.RERANK_TIMEOUT,
         )
 
         if response.status_code != 200:

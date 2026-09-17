@@ -6,7 +6,6 @@
 
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
-
 from src.rag.evaluation.token_tracker import TokenTracker
 
 

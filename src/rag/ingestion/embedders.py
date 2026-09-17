@@ -5,7 +5,6 @@
 # ============================================================
 
 from langchain_community.embeddings import DashScopeEmbeddings
-from loguru import logger
 
 from src.core.config import get_settings
 
@@ -22,12 +21,11 @@ class DenseEmbedder:
         )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        """生成 dense 向量。超长文本截断到 6000 chars 避免 DashScope 8192 token 限制"""
+        """生成 dense 向量。超长文本截断到 6000 chars 避免 DashScope 8192 token 限制。
+
+        ★ 失败直接抛异常，绝不返回 []：调用方（pipeline）依赖"嵌入全部成功"
+          这一前提决定是否删除旧版本数据，吞错会导致线上文档被误删。"""
         if not texts:
             return []
         truncated = [t[:6000] if len(t) > 6000 else t for t in texts]
-        try:
-            return await self.model.aembed_documents(truncated)
-        except Exception as e:
-            logger.error(f"dense embedding 失败: {e}")
-            return []
+        return await self.model.aembed_documents(truncated)

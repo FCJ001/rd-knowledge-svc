@@ -12,7 +12,6 @@ from trulens.core.metric import Metric
 from trulens.core.metric.selector import Selector
 from trulens.providers.litellm import LiteLLM
 
-
 # ════════════════════════════════════════════════════════════════
 # RAG Triad 三指标
 # ════════════════════════════════════════════════════════════════

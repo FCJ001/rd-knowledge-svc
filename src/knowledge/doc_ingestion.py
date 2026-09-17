@@ -9,13 +9,18 @@
 # 幂等：doc_id = md5(doc_name)[:16]，同名重复上传覆盖旧数据。
 # ============================================================
 
+import asyncio
 import hashlib
 
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.infra.milvus_client import get_milvus_client
+from src.infra.milvus_client import (
+    assert_valid_doc_id,
+    escape_milvus_string,
+    get_milvus_client,
+)
 from src.knowledge.model import DocIngestJob, KnowledgeDoc
 from src.rag.ingestion.pipeline import DocMetadata, get_ingestion_pipeline
 
@@ -106,7 +111,7 @@ async def process_ingestion(
     doc = result.scalar_one_or_none()
     if doc:
         doc.status = "indexed"
-        doc.chunk_count = _count_chunks(result_doc_id)
+        doc.chunk_count = await _count_chunks(result_doc_id)
 
     # 更新 job 完成
     await _set_job(db, job_id, stage="index", progress=100, doc_id=result_doc_id)
@@ -135,28 +140,74 @@ async def _set_job(
         job.error_msg = error
 
 
-def _count_chunks(doc_id: str) -> int:
-    """查 Milvus 统计 chunk 数"""
+async def _count_chunks(doc_id: str) -> int:
+    """查 Milvus 统计 chunk 数（同步 gRPC 调用放线程池，不阻塞事件循环）"""
+    assert_valid_doc_id(doc_id)
     milvus = get_milvus_client()
-    results = milvus.query(
+    results = await asyncio.to_thread(
+        milvus.query,
         collection_name="alm_docs",
-        filter=f'doc_id == "{doc_id}"',
+        filter=f'doc_id == "{escape_milvus_string(doc_id)}"',
         output_fields=["id"],
     )
     return len(results)
 
 
 async def delete_doc(doc_id: str, db: AsyncSession | None = None) -> None:
-    """删除文档（Milvus + PG 元数据）"""
-    milvus = get_milvus_client()
-    milvus.delete(collection_name="alm_docs", filter=f'doc_id == "{doc_id}"')
+    """删除文档：Milvus 向量 + MinIO 原文件/图片 + PG 软删 + 查询缓存失效。
 
+    ★ 旧实现只删 Milvus + 标记 PG，MinIO 对象与缓存残留：
+      删除后 TTL 内缓存仍返回已删文档的答案，MinIO 对象永久泄漏存储。"""
+    assert_valid_doc_id(doc_id)
+    milvus = get_milvus_client()
+
+    milvus_ok = True
+    try:
+        await asyncio.to_thread(
+            milvus.delete,
+            collection_name="alm_docs",
+            filter=f'doc_id == "{escape_milvus_string(doc_id)}"',
+        )
+    except Exception as e:
+        milvus_ok = False
+        logger.error(f"Milvus 删除失败 doc_id={doc_id}: {e}")
+
+    # MinIO：原始文件 + 图片目录，尽力而为（失败只记日志，不影响主流程）
+    minio_deleted = 0
     if db:
         result = await db.execute(
             select(KnowledgeDoc).where(KnowledgeDoc.doc_id == doc_id)
         )
         doc = result.scalar_one_or_none()
         if doc:
+            from src.infra.minio_client import delete_prefix
+            if doc.minio_key:
+                try:
+                    await asyncio.to_thread(
+                        _delete_minio_object_safe, doc.minio_key,
+                    )
+                    minio_deleted += 1
+                except Exception as e:
+                    logger.warning(f"MinIO 原文件删除失败 {doc.minio_key}: {e}")
+            try:
+                minio_deleted += await asyncio.to_thread(
+                    delete_prefix, f"images/{doc_id}/",
+                )
+            except Exception as e:
+                logger.warning(f"MinIO 图片目录删除失败 images/{doc_id}/: {e}")
+
             doc.status = "deleted"
 
-    logger.info(f"文档已删除: doc_id={doc_id}")
+    # 查询缓存：删除后立即失效，不等 TTL（300s 内继续返回已删文档的答案是事故）
+    from src.core.cache import invalidate_search_cache
+    await invalidate_search_cache()
+
+    logger.info(
+        f"文档已删除: doc_id={doc_id} milvus={'ok' if milvus_ok else 'FAILED'} "
+        f"minio_objects={minio_deleted}"
+    )
+
+
+def _delete_minio_object_safe(object_name: str) -> None:
+    from src.infra.minio_client import delete_object
+    delete_object(object_name)

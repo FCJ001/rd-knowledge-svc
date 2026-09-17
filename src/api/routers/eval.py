@@ -5,12 +5,14 @@
 # GET /api/v1/eval/scores/summary   汇总统计
 # ============================================================
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from src.core.base_schema import ResponseSchema
 from src.core.config import get_settings
+from src.core.deps import UserContext, get_current_user
+from src.core.logger import logger
 
 router = APIRouter(prefix="/api/v1/eval", tags=["评估结果"])
 
@@ -32,6 +34,7 @@ def _get_eval_engine():
 async def get_eval_scores(
     limit: int = Query(default=50, ge=1, le=200, description="返回条数"),
     eval_type: str = Query(default="", description="nl2sql / knowledge / offline，空=全部"),
+    user: UserContext = Depends(get_current_user),
 ):
     """查询评测结果列表（在线 + TruLens 离线记录）"""
     engine = _get_eval_engine()
@@ -62,6 +65,7 @@ async def get_eval_scores(
                         "COALESCE(token_output, 0) AS token_output, "
                         "COALESCE(token_calls, 0) AS token_calls, "
                         "COALESCE(token_cost_usd, 0) AS token_cost_usd, "
+                        "COALESCE(latency_ms, 0) AS latency_ms, "
                         "created_at AT TIME ZONE 'Asia/Shanghai' AS created_at "
                         "FROM online_scores "
                         f"{type_filter} "
@@ -90,10 +94,12 @@ async def get_eval_scores(
                         "token_output": row.token_output,
                         "token_calls": row.token_calls,
                         "token_cost_usd": row.token_cost_usd,
+                        "latency_ms": row.latency_ms,
                         "created_at": row.created_at.isoformat() if row.created_at else "",
                     })
-            except Exception:
-                pass  # online_scores 表可能还不存在
+            except Exception as e:
+                # online_scores 表可能还不存在（首次部署）：预期场景降级为 debug
+                logger.debug(f"online_scores 查询失败（表可能不存在）: {e}")
 
         # ── TruLens 离线评测记录 ──
         if not eval_type or eval_type == "offline":
@@ -141,15 +147,15 @@ async def get_eval_scores(
                         item["feedbacks"] = feedbacks.get(item["id"], {})
 
                 items.extend(tru_items)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"TruLens 离线记录查询失败: {e}")
 
     items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return ResponseSchema(data={"items": items[:limit], "total": len(items)})
 
 
 @router.get("/scores/summary", response_model=ResponseSchema[dict])
-async def get_eval_summary():
+async def get_eval_summary(user: UserContext = Depends(get_current_user)):
     """评测汇总统计"""
     engine = _get_eval_engine()
     async with engine.begin() as conn:
@@ -164,10 +170,12 @@ async def get_eval_summary():
                     "  COALESCE(AVG(score_sql_valid) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'nl2sql'), 0) AS avg_sql_valid, "
                     "  COALESCE(AVG(score_has_data) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'nl2sql'), 0) AS avg_has_data, "
                     "  COALESCE(AVG(score_relevance) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'nl2sql'), 0) AS avg_nl2sql_relevance, "
+                    "  COALESCE(AVG(NULLIF(latency_ms, 0)) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'nl2sql'), 0) AS avg_nl2sql_latency_ms, "
                     "  COUNT(*) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'nl2sql') AS nl2sql_total, "
                     "  COALESCE(AVG(score_relevance) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'knowledge'), 0) AS avg_knowledge_relevance, "
                     "  COALESCE(AVG(score_context_relevance) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'knowledge'), 0) AS avg_context_relevance, "
                     "  COALESCE(AVG(score_groundedness) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'knowledge'), 0) AS avg_groundedness, "
+                    "  COALESCE(AVG(NULLIF(latency_ms, 0)) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'knowledge'), 0) AS avg_knowledge_latency_ms, "
                     "  COUNT(*) FILTER (WHERE COALESCE(eval_type,'nl2sql') = 'knowledge') AS knowledge_total "
                     "FROM online_scores"
                 )
@@ -180,16 +188,18 @@ async def get_eval_summary():
                     "avg_sql_valid": round(r.avg_sql_valid, 2),
                     "avg_has_data": round(r.avg_has_data, 2),
                     "avg_relevance": round(r.avg_nl2sql_relevance, 2),
+                    "avg_latency_ms": round(r.avg_nl2sql_latency_ms),
                 },
                 "knowledge": {
                     "total": r.knowledge_total,
                     "avg_answer_relevance": round(r.avg_knowledge_relevance, 2),
                     "avg_context_relevance": round(r.avg_context_relevance, 2),
                     "avg_groundedness": round(r.avg_groundedness, 2),
+                    "avg_latency_ms": round(r.avg_knowledge_latency_ms),
                 },
             }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"在线评测统计查询失败: {e}")
 
         # ── TruLens 离线统计 ──
         try:
@@ -217,7 +227,7 @@ async def get_eval_summary():
                 "total_records": total_count,
                 "by_metric": by_metric,
             }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"TruLens 离线统计查询失败: {e}")
 
         return ResponseSchema(data=data)

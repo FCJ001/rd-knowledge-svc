@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import defaultdict, deque
+from uuid import uuid4
 
 from fastapi import Depends, HTTPException, Request
 from loguru import logger
@@ -48,6 +49,22 @@ class SlidingWindowRateLimiter:
                 window.append(now)
                 return True
             return False
+        # 空 key 由周期清理移除（见 _cleanup），避免 user_id 基数下缓慢泄漏
+
+    async def _cleanup(self) -> int:
+        """移除窗口已空的 key，防止内存无界增长。定期（如每分钟）调用。"""
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        removed = 0
+        async with self._lock:
+            for key in list(self._hits.keys()):
+                window = self._hits[key]
+                while window and window[0] <= cutoff:
+                    window.popleft()
+                if not window:
+                    del self._hits[key]
+                    removed += 1
+        return removed
 
 
 class RedisSlidingWindowRateLimiter:
@@ -58,6 +75,8 @@ class RedisSlidingWindowRateLimiter:
     """
 
     # KEYS[1]=限流key  ARGV[1]=now(ms)  ARGV[2]=window(ms)  ARGV[3]=max_requests
+    #  ARGV[4]=本次请求唯一 id —— ZSET member 必须唯一：member=now 时同一毫秒内
+    #  的并发请求会互相覆盖，计数偏少导致限流被击穿
     _LUA = """
 local now = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
@@ -65,7 +84,7 @@ local max = tonumber(ARGV[3])
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
 local count = redis.call('ZCARD', KEYS[1])
 if count < max then
-  redis.call('ZADD', KEYS[1], now, now)
+  redis.call('ZADD', KEYS[1], now, ARGV[4])
   redis.call('PEXPIRE', KEYS[1], window)
   return 1
 end
@@ -83,7 +102,10 @@ return 0
         try:
             result = await self._script(
                 keys=[f"alm_rl:{key}"],
-                args=[str(now_ms), str(self._window_ms), str(self.max_requests)],
+                args=[
+                    str(now_ms), str(self._window_ms), str(self.max_requests),
+                    f"{now_ms}-{uuid4().hex}",
+                ],
             )
             return bool(result)
         except Exception as e:

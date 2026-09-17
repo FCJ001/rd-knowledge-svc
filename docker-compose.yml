@@ -1,0 +1,123 @@
+# ============================================================
+# 本地/预发一键编排：API + 入库 worker + 全部基础设施
+# 生产建议：基础设施用云托管实例，仅 api/worker 走容器编排（k8s）
+#
+# 启动：docker compose up -d --build
+# 注意：APP_ENV 非 prod 时为开发语义（header 认证、CORS 放开）
+# ============================================================
+
+x-app-base: &app-base
+  build: .
+  image: rd-knowledge-svc
+  env_file: .env
+  environment:
+    - APP_ENV=${APP_ENV:-dev}
+    - DB_HOST=postgres
+    - REDIS_HOST=redis
+    - MILVUS_HOST=milvus
+    - NEO4J_URI=bolt://neo4j:7687
+    - MINIO_ENDPOINT=minio:9000
+  volumes:
+    - ./logs:/tmp/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+
+services:
+  api:
+    <<: *app-base
+    ports:
+      - "8002:8002"
+    restart: unless-stopped
+    # ★ 生产（APP_ENV=prod）：健康检查失败自动摘除重启
+
+  worker:
+    <<: *app-base
+    command: ["python", "-m", "src.rag.ingestion.worker"]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: rdagent
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-rdagent123}
+      POSTGRES_DB: rd_knowledge
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rdagent -d rd_knowledge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.6.10
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_USE_EMBED: "true"
+      COMMON_STORAGETYPE: local
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-rdagent123}
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  redis_data:
+  minio_data:
+  milvus_data:
+  neo4j_data:

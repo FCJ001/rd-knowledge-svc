@@ -1,9 +1,15 @@
 # ============================================================
 # Dense + BM25 Sparse 混合检索，RRF(k=60) 融合
 # ★ 与天宫医疗一致：sparse 向量由 Milvus 2.6 内置 BM25 Function 自动生成
+# ★ pymilvus 是同步 gRPC 客户端：必须 to_thread 下放线程池，
+#   否则慢查询会冻结整个事件循环（所有并发请求一起卡死）
 # ============================================================
 
+import asyncio
+
 from pymilvus import AnnSearchRequest, MilvusClient, RRFRanker
+
+from src.infra.milvus_client import escape_milvus_string
 
 
 async def hybrid_search(
@@ -49,7 +55,8 @@ async def hybrid_search(
         for vec in (extra_dense_queries or [])
     ]
 
-    results = milvus.hybrid_search(
+    results = await asyncio.to_thread(
+        milvus.hybrid_search,
         collection_name=collection_name,
         reqs=[dense_req, sparse_req, *extra_reqs],
         ranker=RRFRanker(k=60),
@@ -73,11 +80,12 @@ async def hybrid_search(
 
 
 def _build_filter(filters: dict) -> str:
+    """构造 Milvus 布尔表达式。值一律经过转义，防表达式注入。"""
     parts = []
     for key, value in filters.items():
         if isinstance(value, list):
-            values_str = ", ".join(f'"{v}"' for v in value)
+            values_str = ", ".join(f'"{escape_milvus_string(v)}"' for v in value)
             parts.append(f'{key} in [{values_str}]')
         else:
-            parts.append(f'{key} == "{value}"')
+            parts.append(f'{key} == "{escape_milvus_string(value)}"')
     return " and ".join(parts)

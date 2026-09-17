@@ -1,0 +1,26 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "scripts"]
+exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear（常见 bug 模式）
+    "ASYNC",  # async 常见错误（如阻塞调用）
+    "UP",  # 过时语法
+]
+ignore = [
+    "E501",  # 行宽交给 formatter，避免和中文注释/长 URL 打架
+    "B008",  # FastAPI Depends() 的标准用法
+    "B904",  # raise ... from 在 except-raise 场景噪音大
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+# main.py：路由注册须在 app/middleware 创建之后（FastAPI 惯用模式）
+"src/main.py" = ["E402"]

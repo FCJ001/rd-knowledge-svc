@@ -56,22 +56,42 @@ ENTITY_EXTRACT_PROMPT = """你是一个汽车研发领域的实体提取助手�
 NL2CYPHER_PROMPT = """你是一个 Neo4j Cypher 查询生成助手。
 知识图谱包含以下节点和关系：
 
-节点类型：
-- Phenomenon（现象）：code, description
-- RootCause（根因）：description
-- ConfigItem（配置项）：name, type
-- Baseline（基线）：name, status, freeze_date
-- Requirement（需求）：code, title, status
-- OwnerDomain（责任域）：name
-- Change（变更）：cr_id, title, status
+节点类型（★ 属性名以实际图谱为准，Cypher 必须用这些属性名）：
+- Phenomenon（现象）：name, code
+- RootCause（根因）：code, name, domain, description, fix_way, dtc
+- ConfigItem（配置项）：ci_no, name, module, supplier
+- Baseline（基线）：baseline_no, name, is_frozen
+- Requirement（需求）：req_no, title, status
+- OwnerDomain（责任域）：name, business_line
+- ChangeRequest（变更）：cr_no, title, status
+- DTC（故障码）：code
 
-关系类型：
-- CAUSED_BY（现象→根因）
-- AFFECTS（现象→配置项）
-- BLOCKED_BY（需求→基线，基线冻结阻塞需求）
-- ASSIGNED_TO（配置项→责任域）
-- TRIGGERS_ISSUE（变更→现象）
-- IMPLEMENTS（变更→需求）
+关系类型（★ 只存在这些关系，禁止生成其他关系名）：
+- (:RootCause)-[:INDICATES]->(:Phenomenon)   根因指向其典型现象（属性 weight, is_core）
+- (:DTC)-[:POINTS_TO]->(:RootCause)          故障码指向根因
+- (:RootCause)-[:LOCATED_IN]->(:ConfigItem)  根因定位到配置项
+- (:RootCause)-[:CO_OCCURS_WITH]->(:RootCause) 伴随根因
+- (:RootCause)-[:BELONGS_TO]->(:OwnerDomain) 根因归属责任域
+- (:ConfigItem)-[:DEPENDS_ON]->(:ConfigItem) 配置项依赖（1~2跳）
+- (:Requirement)-[:AFFECTS]->(:ConfigItem)   需求影响配置项
+- (:Requirement)-[:ASSIGNED_TO]->(:Baseline) 需求分配到基线
+- (:ChangeRequest)-[:TARGETS]->(:Baseline)   变更指向基线
+
+关键词匹配规则（★ 极重要，违反必查空）：
+- WHERE 过滤只能用【提取的实体】里拆出的短词（2~6 字，如「电机控制器」「过热」「异响」），
+  用 CONTAINS 逐词 OR 组合：WHERE (ph.name CONTAINS '过热' OR ph.name CONTAINS '电机')
+- 禁止把用户问题整句作为 CONTAINS 的匹配值——图谱属性是短词，整句必查空。
+- 【提取的实体】为空时，从问题中自行拆出核心名词短语作为关键词。
+
+常见查询示例：
+- 某现象可能由哪些根因引起：
+  MATCH (rc:RootCause)-[:INDICATES]->(ph:Phenomenon)
+  WHERE (ph.name CONTAINS '关键词1' OR ph.name CONTAINS '关键词2')
+  OPTIONAL MATCH (rc)-[:BELONGS_TO]->(od:OwnerDomain)
+  RETURN rc.name, rc.description, od.name LIMIT 10
+- 某配置项相关根因：MATCH (rc:RootCause)-[:LOCATED_IN]->(ci:ConfigItem)
+  WHERE (ci.name CONTAINS '关键词') RETURN rc.name, rc.description LIMIT 10
+- 必须带 LIMIT。
 
 用户问题：{question}
 提取的实体：{entities}

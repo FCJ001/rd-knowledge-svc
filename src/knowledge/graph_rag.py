@@ -1,20 +1,34 @@
 # ============================================================
 # GraphRAG：实体提取 → NL2Cypher（最多 3 次重试）→ LLM 整合
-# 读项目一的 Neo4j，只读账号
+# 读项目一的 Neo4j。
+# ★ 只读强制（双保险）：
+#   1. 关键词拦截 —— LLM 生成的 Cypher 含任何写子句直接拒绝；
+#   2. READ_ACCESS 会话 —— 即使拦截被绕过（如 CALL 存储过程），数据库侧也拒绝写。
 # ============================================================
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 from loguru import logger
-from neo4j import AsyncDriver
+from neo4j import READ_ACCESS, AsyncDriver
 
-from src.knowledge.prompts import ENTITY_EXTRACT_PROMPT, NL2CYPHER_PROMPT, GRAPH_QA_PROMPT
+from src.core.config import get_settings
+from src.knowledge.prompts import ENTITY_EXTRACT_PROMPT, GRAPH_QA_PROMPT, NL2CYPHER_PROMPT
 
 MAX_CYPHER_RETRIES = 2
+
+# 写子句黑名单：LLM 输出出现任意一个即拒绝执行（问题文本可注入 prompt，
+# 所以不能信任 LLM "只会生成读查询"这一假设）
+_CYPHER_WRITE_RE = re.compile(
+    r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|FOREACH|LOAD\s+CSV)\b"
+    r"|\bCALL\s+(dbms|db)\.",
+    re.IGNORECASE,
+)
 
 
 async def _extract_entities(question: str, llm: BaseChatModel) -> dict:
@@ -51,8 +65,17 @@ async def _generate_cypher(
 async def _execute_cypher(cypher: str, neo4j_driver: AsyncDriver) -> list[dict]:
     if not cypher:
         return []
-    records, summary, keys = await neo4j_driver.execute_query(cypher)
-    return [dict(zip(keys, record)) for record in records]
+    if _CYPHER_WRITE_RE.search(cypher):
+        raise ValueError("拒绝执行包含写操作的 Cypher（只读通道）")
+    settings = get_settings()
+
+    async def _run() -> list[dict]:
+        # READ_ACCESS：数据库侧强制只读，写语句直接被 Neo4j 拒绝
+        async with neo4j_driver.session(default_access_mode=READ_ACCESS) as session:
+            result = await session.run(cypher)
+            return await result.data()
+
+    return await asyncio.wait_for(_run(), timeout=settings.NEO4J_QUERY_TIMEOUT)
 
 
 async def search_graph_raw(

@@ -32,10 +32,11 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from uuid import uuid4
 
 from loguru import logger
 
-from src.core.metrics import ASYNC_TASK_RETRIES, CIRCUIT_BREAKER_CHANGES
+from src.core.metrics import ASYNC_TASK_RETRIES, CIRCUIT_BREAKER_CHANGES, CIRCUIT_BREAKER_STATE
 
 # Redis 单次操作超时：熔断检查在请求关键路径上，不能被慢 Redis 拖住
 _REDIS_OP_TIMEOUT = 0.5
@@ -51,20 +52,31 @@ class CircuitOpenError(Exception):
 # ── Lua：原子状态迁移（KEYS[1]=状态 Hash，KEYS[2]=探针锁）───────────────
 
 # 返回 1=放行 0=拒绝 2=放行且本调用是半开探针
+# ★ 半开态只放行持探针 token 的那一个在途调用：探针锁的值就是 token，
+#   其余请求一律拒绝 —— 修复"半开期所有副本所有并发请求全部放行"的惊群缺陷。
 _LUA_ACQUIRE = """
 local st = redis.call('HGET', KEYS[1], 'state')
 if not st then st = 'closed' end
 local now = tonumber(ARGV[1])
 local reset = tonumber(ARGV[2])
+local token = ARGV[3]
 if st == 'open' then
   local opened = tonumber(redis.call('HGET', KEYS[1], 'opened_at') or '0')
   if now - opened < reset then
     return 0
   end
-  -- 复位窗口已过：SETNX 抢探针锁，只放一个副本探测
+  -- 复位窗口已过：SETNX 抢探针锁（值=探针 token），只放一个副本探测
   local ttl = math.max(1, math.ceil(reset))
-  if redis.call('SET', KEYS[2], '1', 'EX', ttl, 'NX') then
+  if redis.call('SET', KEYS[2], token, 'EX', ttl, 'NX') then
     redis.call('HSET', KEYS[1], 'state', 'half_open')
+    return 2
+  end
+  return 0
+end
+if st == 'half_open' then
+  -- 半开期：只放行持有探针锁（token 匹配）的在途探针，其余全部快速拒绝
+  local probe = redis.call('GET', KEYS[2])
+  if probe and probe == token then
     return 2
   end
   return 0
@@ -164,6 +176,7 @@ class CircuitBreaker:
         self._state = "closed"
         self._failures = 0
         self._opened_at: float | None = None
+        self._probe_token: str = ""  # 当前半开探针的 token（降级路径用）
         self._lock = asyncio.Lock()
 
     # ── Redis key ──────────────────────────────────────────────
@@ -214,9 +227,13 @@ class CircuitBreaker:
     # ── 调用入口 ───────────────────────────────────────────────
 
     async def call(self, fn, *args, **kwargs):
-        """执行目标调用，带熔断保护。fn 为 async callable。"""
+        """执行目标调用，带熔断保护。fn 为 async callable。
+
+        每次调用生成独立 token：抢到半开探针锁的调用凭 token 放行，
+        其余调用在半开期被快速拒绝。"""
+        token = uuid4().hex
         async with self._lock:
-            allowed = await self._acquire()
+            allowed = await self._acquire(token)
         if not allowed:
             raise CircuitOpenError(self.target)
 
@@ -233,16 +250,17 @@ class CircuitBreaker:
 
     # ── 状态迁移（Redis 优先，异常降级进程内）──────────────────
 
-    async def _acquire(self) -> bool:
+    async def _acquire(self, token: str) -> bool:
         """准入检查。True=放行（含半开探针），False=熔断期拒绝。"""
         if self.use_redis:
             ret = await self._eval(
-                _LUA_ACQUIRE, repr(time.time()), repr(self.reset_timeout),
+                _LUA_ACQUIRE, repr(time.time()), repr(self.reset_timeout), token,
             )
             if ret is not None:
                 if ret == 2:
                     self._set_local("half_open")
                     self._record("half_open")
+                    self._probe_token = token
                 elif ret == 0:
                     # 拒绝时镜像保持 open（若已过窗口，镜像标 half_open 更贴近）
                     self._set_local("half_open" if self.state == "half_open" else "open")
@@ -250,13 +268,18 @@ class CircuitBreaker:
                     self._set_local("closed")
                 return ret in (1, 2)
 
-        # 降级：进程内判定（与原单副本语义一致）
+        # 降级：进程内判定（与 Redis 语义一致：半开只放一个探针）
         now = time.time()
         if self._state == "open":
             if now - (self._opened_at or now) >= self.reset_timeout:
                 self._set_local("half_open")
                 self._record("half_open")
+                self._probe_token = token
             else:
+                return False
+        elif self._state == "half_open":
+            # 半开期只放行持探针 token 的在途调用
+            if self._probe_token != token:
                 return False
         return True
 
@@ -308,6 +331,10 @@ class CircuitBreaker:
 
     def _record(self, state: str) -> None:
         CIRCUIT_BREAKER_CHANGES.labels(target=self.target, state=state).inc()
+        # 实时状态 Gauge：告警可直接对单值判断（0=closed 1=half_open 2=open）
+        CIRCUIT_BREAKER_STATE.labels(target=self.target).set(
+            {"closed": 0, "half_open": 1, "open": 2}.get(state, 0)
+        )
 
 
 # 通道级熔断器单例（进程内共享，跨请求持久；状态本身按 use_redis 外置）

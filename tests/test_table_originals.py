@@ -7,9 +7,8 @@
 
 import asyncio
 
-import pytest
 import pymupdf
-
+import pytest
 from src.rag.ingestion import pipeline as pipe_mod
 
 
@@ -61,7 +60,6 @@ def pipeline(monkeypatch):
 @pytest.fixture
 def fake_doc(monkeypatch):
     """拦截 pymupdf.open，返回文本层页面（含表格行文本块）"""
-    rows = [(120.0, 240.0, 580.0, 300.0)]  # 表格文本块
     page = FakePage(A4, blocks=[(110.0, 240.0, 580.0, 300.0, "A", None, None)])
     doc = FakeDoc([page, page])
     monkeypatch.setattr(pymupdf, "open", lambda path: doc)

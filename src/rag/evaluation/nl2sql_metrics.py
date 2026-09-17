@@ -10,7 +10,6 @@ import re
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 
-
 RESULT_RELEVANCE_PROMPT = """你是 NL2SQL 查询质量评审专家。根据用户问题和 SQL 返回的数据摘要，判断查询结果是否与问题相关。
 请使用 0.0-1.0 的连续评分，**不要都打同一分数**。
 

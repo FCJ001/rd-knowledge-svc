@@ -10,7 +10,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Float, Integer, String, Text, DateTime, Boolean, func
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.core.base_model import Base, BaseModel

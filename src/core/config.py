@@ -10,15 +10,28 @@
 # ============================================================
 
 from functools import lru_cache
+from urllib.parse import quote_plus
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
     # ---------------- 应用 ----------------
     APP_NAME: str = "rd-knowledge-svc"
-    APP_ENV: str = "dev"
-    APP_DEBUG: bool = True
+    APP_ENV: str = "dev"                  # dev / test / prod
+    APP_DEBUG: bool = False               # ★ 生产安全默认：debug 关（SQL echo、FastAPI debug 随之关）
+
+    # ---------------- 认证 ----------------
+    # header：开发期/网关可信模式，直接信任 X-User-* 请求头（网关必须剥离外部同名头）
+    # jwt：验签 Authorization: Bearer <token>，密钥从环境注入
+    AUTH_MODE: str = "header"
+    JWT_SECRET: str = ""                  # HS256 验签密钥（AUTH_MODE=jwt 时必填，禁止硬编码）
+    JWT_PUBLIC_KEY: str = ""              # RS256 公钥（PEM，上游网关签发时用）
+    JWT_ALGORITHM: str = "HS256"          # HS256 / RS256
+
+    # ---------------- 跨域 ----------------
+    CORS_ORIGINS: str = "*"               # 逗号分隔的显式 origin 列表；生产必须收敛
 
     # ---------------- PostgreSQL（共享实例，独立库）----------------
     DB_HOST: str = "localhost"
@@ -32,6 +45,8 @@ class Settings(BaseSettings):
     REDIS_PORT: int = 6379
     REDIS_PASSWORD: str = ""
     REDIS_DB: int = 0
+    REDIS_SOCKET_TIMEOUT: float = 5.0     # 单命令读写超时（worker 的 XREADGROUP block 需小于此值）
+    REDIS_MAX_CONNECTIONS: int = 100      # 连接池上限，防无界增长
 
     # ---------------- MinIO ----------------
     MINIO_ENDPOINT: str = "localhost:9000"
@@ -39,15 +54,25 @@ class Settings(BaseSettings):
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_BUCKET: str = "knowledge-docs"
     MINIO_SECURE: bool = False
+    MINIO_PUBLIC_READ: bool = True        # 桶公共读策略（前端 <img> 直连）；生产建议改预签名 URL 后关闭
+
+    # ---------------- PostgreSQL 连接池 ----------------
+    DB_POOL_ENABLED: bool = True          # False 回退 NullPool（每请求新建连接）
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
 
     # ---------------- Milvus ----------------
     MILVUS_HOST: str = "localhost"
     MILVUS_PORT: int = 19530
+    MILVUS_TIMEOUT: float = 10.0          # Milvus 客户端请求超时（秒），兜底所有 gRPC 调用
 
     # ---------------- Neo4j ----------------
     NEO4J_URI: str = "bolt://localhost:7687"
     NEO4J_USER: str = "neo4j"
     NEO4J_PASSWORD: str = "rdagent123"
+    NEO4J_CONNECTION_TIMEOUT: float = 5.0   # 建连超时（秒）
+    NEO4J_MAX_POOL_SIZE: int = 50           # driver 连接池上限
+    NEO4J_QUERY_TIMEOUT: float = 10.0       # 单条 Cypher 执行超时（秒）
 
     # ---------------- 模型 ----------------
     DASHSCOPE_API_KEY: str = ""
@@ -62,13 +87,22 @@ class Settings(BaseSettings):
     MINERU_API_URL: str = "http://117.50.195.135:8000"
     MINERU_BACKEND: str = "hybrid-auto-engine"
     MINERU_TIMEOUT: int = 300
-
     # ---------------- RAG ----------------
-    RAG_TOP_K: int = 20
-    RAG_RERANK_TOP_K: int = 5
-    RAG_HYDE_ENABLED: bool = False
+    # ★ 下面四项是检索调参旋钮，由 scripts/run_rag_experiments.py 显式传入
+    #   （服务运行时走 doc_rag.search_docs_raw 的函数默认值，API 层按请求覆盖）。
+    #   这里是"离线调参的单一事实来源"：改 .env 即可让消融脚本用新参数跑，
+    #   不必改代码。**不要把函数默认值改掉**——离线/在线口径必须一致。
+    RAG_TOP_K: int = 20            # 初召条数（召回是天花板，精排救不回没召回的）
+    RAG_RERANK_TOP_K: int = 5      # 精排目标条数（动态截断关闭时的固定值）
+    RAG_HYDE_ENABLED: bool = False # HyDE：多一次 LLM 调用换语义鸿沟跨越
     RAG_HYBRID_ENABLED: bool = False
     RAG_DYNAMIC_TOPK: bool = True  # Rerank 后按分数断崖动态截断（最多 10 条）
+    RERANK_TIMEOUT: float = 10.0   # 精排调用超时（秒），超时回退向量距离排序
+
+    # ---------------- LLM 超时 ----------------
+    LLM_REQUEST_TIMEOUT: float = 120.0    # 单次 LLM HTTP 请求超时（openai 客户端层）
+    GENERATION_TIMEOUT: float = 120.0     # 最终答案生成整体超时（秒），防 LLM 端挂起拖死请求
+    HALLUCINATION_TIMEOUT: float = 30.0   # 幻觉检测超时（秒），fail-open
 
     # ---------------- 图片 VL 摘要 ----------------
     VL_MODEL: str = "qwen-vl-max"
@@ -95,6 +129,10 @@ class Settings(BaseSettings):
     # ---------------- 查询缓存 ----------------
     QUERY_CACHE_ENABLED: bool = True       # 知识检索结果缓存（文档/图谱相对静态，安全）
     QUERY_CACHE_TTL: int = 300             # 缓存有效期（秒）
+
+    # ---------------- 上传 ----------------
+    UPLOAD_MAX_MB: int = 200               # 上传文件大小上限（MB），防磁盘耗尽
+    ALLOWED_UPLOAD_SUFFIXES: str = ".pdf,.doc,.docx,.md,.txt"  # 扩展名白名单（逗号分隔）
 
     # ---------------- 入库异步任务（Redis Stream + worker）----------------
     INGEST_STREAM: str = "alm_ingest:jobs"        # 入库任务 Stream
@@ -134,18 +172,35 @@ class Settings(BaseSettings):
     MODEL_PRICING_OUTPUT: float = 1.2  # qwen-max 输出 $1.2/1M
 
     # ---------------- 日志 ----------------
-    LOG_LEVEL: str = "DEBUG"
+    LOG_LEVEL: str = "INFO"
     LOG_DIR: str = "logs"
     AUDIT_LOG_RETENTION: str = "180 days"
 
     # ---------------- 项目一（跨服务调知识库）----------------
     KNOWLEDGE_SVC_URL: str = "http://localhost:8001"
 
+    @model_validator(mode="after")
+    def _prod_safety_check(self) -> "Settings":
+        """生产环境防呆：危险默认值在 prod 下直接拒绝启动。"""
+        if self.APP_ENV == "prod":
+            problems = []
+            if self.APP_DEBUG:
+                problems.append("APP_DEBUG 必须为 false")
+            if self.AUTH_MODE == "jwt" and not (self.JWT_SECRET or self.JWT_PUBLIC_KEY):
+                problems.append("AUTH_MODE=jwt 时必须配置 JWT_SECRET 或 JWT_PUBLIC_KEY")
+            if self.JWT_SECRET == "12af38e3ab85909849bfe0b89f89075d7677438a0f14c0304a46249ae513558d":
+                problems.append("JWT_SECRET 是已泄露的旧密钥，必须更换")
+            if self.CORS_ORIGINS.strip() == "*":
+                problems.append("CORS_ORIGINS 必须收敛为显式 origin 列表")
+            if problems:
+                raise ValueError(f"生产配置校验失败: {'; '.join(problems)}")
+        return self
+
     @property
     def DATABASE_URL(self) -> str:
-        """本服务自有库 rd_knowledge"""
+        """本服务自有库 rd_knowledge（密码 URL 编码，特殊字符不破坏连接串）"""
         return (
-            f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}"
+            f"postgresql+asyncpg://{self.DB_USER}:{quote_plus(self.DB_PASSWORD)}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
         )
 

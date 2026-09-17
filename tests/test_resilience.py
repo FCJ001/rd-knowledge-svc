@@ -7,9 +7,7 @@
 import asyncio
 
 import pytest
-
 from src.core.resilience import CircuitBreaker, CircuitOpenError, with_retry
-
 
 # ── with_retry ───────────────────────────────────────────────
 

@@ -6,10 +6,10 @@
 from dataclasses import dataclass
 from typing import ClassVar
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.embeddings import Embeddings
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.core.config import get_settings
 from src.rag.config import ChunkingConfig
@@ -85,7 +85,7 @@ class ParentChildChunker:
         chunks = []
         for pi, parent in enumerate(parent_docs):
             child_docs = self.child_splitter.create_documents([parent.page_content])
-            for ci, child in enumerate(child_docs):
+            for child in child_docs:
                 chunks.append(Chunk(
                     text=child.page_content,
                     metadata={

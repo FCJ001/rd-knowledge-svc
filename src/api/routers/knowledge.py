@@ -1,24 +1,24 @@
 # ============================================================
 # 知识检索 API
 #
-# POST /api/v1/knowledge/search    多通道检索
-# POST /api/v1/knowledge/feedback  用户反馈
-# GET  /api/v1/knowledge/docs      文档列表
+# POST /api/v1/knowledge/search        多通道检索
+# POST /api/v1/knowledge/search-stream 多通道检索（SSE 流式）
+# POST /api/v1/knowledge/feedback      用户反馈
+# GET  /api/v1/knowledge/docs          文档列表
 # ============================================================
 
 import asyncio
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+from sse_starlette.sse import EventSourceResponse
 
-from src.api.deps import get_llm, get_embedding_model
+from src.api.deps import get_embedding_model, get_llm
 from src.core.base_schema import PageResult, ResponseSchema
 from src.core.cache import build_search_cache_key, get_json_cache, set_json_cache
 from src.core.deps import PageParams, UserContext, get_current_user
-from src.core.exceptions import ERR_BAD_REQUEST, ERR_NOT_FOUND, BizException
 from src.core.logger import logger
 from src.core.rate_limit import check_rate_limit
 from src.infra.db import get_db
@@ -30,6 +30,11 @@ from src.rag.evaluation.guardrails import check_output
 from src.rag.evaluation.token_tracker import TokenTracker
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["知识检索"])
+
+# SSE 事件队列上限：断连后生产端继续入队时防内存膨胀；队满丢弃进度类事件
+_SSE_QUEUE_MAX = 500
+# 消费队列的等待上限（秒）：到点回到断连检查，同时给网关兜底心跳之外的活性
+_SSE_QUEUE_POLL_TIMEOUT = 20
 
 
 # ── Request / Response models ────────────────────────────────────────────
@@ -78,6 +83,8 @@ async def search_knowledge(
         model_code=req.model_code,
         use_hyde=req.use_hyde,
         role=user.role,
+        owner_domain_id=user.owner_domain_id,
+        business_line=user.business_line,
     )
     cached = await get_json_cache(cache_key)
     if cached:
@@ -154,7 +161,8 @@ async def search_knowledge(
 
     # ── 异步评估（fire-and-forget，按采样率触发）──
     evaluator = get_async_evaluator()
-    evaluator.evaluate_knowledge(question=req.question, answer=answer, contexts=contexts, token_usage=token_tracker.usage)
+    evaluator.evaluate_knowledge(question=req.question, answer=answer, contexts=contexts,
+                                 token_usage=token_tracker.usage, latency_ms=timer.elapsed_ms)
 
     # ── Token 用量 ──
     usage = token_tracker.usage
@@ -200,12 +208,16 @@ async def search_knowledge_stream(
     from src.knowledge.fusion import multi_channel_search
 
     async def event_stream():
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_SSE_QUEUE_MAX)
         answer_chunks: list[str] = []
         stream_contexts: list = []
 
         def sink(msg: dict):
-            queue.put_nowait(msg)
+            # 队满丢事件而非阻塞管线（进度事件可丢，sentinel/error 必达）
+            try:
+                queue.put_nowait(msg)
+            except asyncio.QueueFull:
+                logger.warning("SSE 事件队列已满，丢弃一条事件")
 
         async def run_to_queue():
             try:
@@ -222,27 +234,60 @@ async def search_knowledge_stream(
                     business_line=user.business_line,
                     event_sink=sink,
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error(f"流式知识检索失败: {e}")
-                await queue.put({"type": "error", "content": str(e)})
+                # ★ 内部细节只进日志，前端只收通用错误信息（防栈/连接串泄露）
+                logger.exception(f"流式知识检索失败: {e}")
+                try:
+                    queue.put_nowait({"type": "error", "content": "检索服务内部错误，请稍后重试"})
+                except asyncio.QueueFull:
+                    pass
             finally:
-                await queue.put(None)  # sentinel
+                try:
+                    queue.put_nowait(None)  # sentinel
+                except asyncio.QueueFull:
+                    await queue.put(None)
 
         task = asyncio.ensure_future(run_to_queue())
+        cancelled_by_client = False
 
         with Timer() as timer:
             try:
                 while True:
-                    msg = await queue.get()
+                    # 定期回到断连检查：客户端断开立即取消管线，LLM token 不白烧
+                    if await request.is_disconnected():
+                        logger.info("SSE 客户端已断开，取消检索管线")
+                        cancelled_by_client = True
+                        task.cancel()
+                        break
+                    try:
+                        msg = await asyncio.wait_for(
+                            queue.get(), timeout=_SSE_QUEUE_POLL_TIMEOUT,
+                        )
+                    except TimeoutError:
+                        continue
                     if msg is None:
                         break
                     if msg.get("type") == "delta":
                         answer_chunks.append(msg.get("content", ""))
                     elif msg.get("type") == "done":
                         stream_contexts = msg.get("contexts") or []
-                    yield f"data: {json.dumps(msg, ensure_ascii=False)}\n\n"
+                    yield {"data": json.dumps(msg, ensure_ascii=False)}
             finally:
-                await task  # ensure pipeline completes
+                # 管线结果善后：取消的要吞掉 CancelledError，正常的等它收尾
+                if not task.done():
+                    task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    if cancelled_by_client:
+                        logger.info("检索管线已随客户端断开而取消")
+                    else:
+                        logger.exception("检索管线收尾异常")
+
+        if cancelled_by_client:
+            return
 
         answer = "".join(answer_chunks)
 
@@ -264,7 +309,8 @@ async def search_knowledge_stream(
 
         # ── 异步评估（fire-and-forget，按采样率触发）──
         evaluator = get_async_evaluator()
-        evaluator.evaluate_knowledge(question=req.question, answer=answer, contexts=stream_contexts, token_usage=token_tracker.usage)
+        evaluator.evaluate_knowledge(question=req.question, answer=answer, contexts=stream_contexts,
+                                     token_usage=token_tracker.usage, latency_ms=timer.elapsed_ms)
 
         # ── Token 用量 ──
         usage = token_tracker.usage
@@ -274,9 +320,10 @@ async def search_knowledge_stream(
             f"cost=${usage['cost_usd']:.6f}"
         )
 
-    return StreamingResponse(
+    # EventSourceResponse：自带 ping 心跳（防网关掐空闲连接）+ 规范的 SSE 编码
+    return EventSourceResponse(
         event_stream(),
-        media_type="text/event-stream",
+        ping=15,
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
@@ -312,7 +359,7 @@ async def list_docs(
     page: PageParams = Depends(),
     db: AsyncSession = Depends(get_db),
 ):
-    """文档元数据列表"""
+    """文档元数据列表（不返回 status=deleted 的软删文档）"""
     from src.core.base_repository import BaseRepository
     repo = BaseRepository(KnowledgeDoc, db)
     items, total = await repo.get_page(
@@ -320,6 +367,8 @@ async def list_docs(
         limit=page.page_size,
         keyword=page.keyword,
         search_fields=["doc_name", "doc_type", "category"],
+        status="deleted",
+        exclude=True,
     )
     docs = [
         {

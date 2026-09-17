@@ -10,19 +10,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from loguru import logger
 from pymilvus import DataType, Function, FunctionType, MilvusClient
 
 from src.core.config import get_settings
+from src.infra.milvus_client import escape_milvus_string
 from src.infra.minio_client import ensure_bucket_exists, upload_file
 from src.rag.config import ChunkingConfig
 from src.rag.ingestion.chunkers import get_chunker, merge_short_chunks
 from src.rag.ingestion.parsers import DocumentParser
+
+if TYPE_CHECKING:
+    import pymupdf
 
 settings = get_settings()
 
@@ -47,7 +53,7 @@ def _normalize_formula(text: str) -> str:
     return re.sub(r"[\s\u00a0]+", "", text or "")
 
 
-def _locate_formula_rect(page, bbox: "pymupdf.Rect", md_before: str) -> "pymupdf.Rect | None":
+def _locate_formula_rect(page, bbox: pymupdf.Rect, md_before: str) -> pymupdf.Rect | None:
     """定位公式在页面上的真实渲染区域（pt 坐标）。
 
     实测 MinerU content_list 的 equation 块 bbox 整体偏高 ~90-110pt、且高度不可靠，
@@ -316,8 +322,8 @@ class IngestionPipeline:
             )
         )
         if not md_text or len(md_text.strip()) < 10:
-            logger.error(f"文档解析后无内容: {meta.doc_name}")
-            return doc_id
+            # 抛错而非静默返回：静默会让空文档标成 indexed 上线，检索永远召回不到
+            raise ValueError(f"文档解析后无内容: {meta.doc_name}")
 
         # ★ 公式原图对照（bbox 裁剪）：content_list 的 equation 块带 bbox，
         #   渲染页面裁剪出公式原图嵌入对应公式下方，防 LaTeX 识别不准确
@@ -356,18 +362,26 @@ class IngestionPipeline:
         )
 
         if not chunks:
-            logger.warning(f"切片后无内容: {meta.doc_name}")
-            return doc_id
+            raise ValueError(f"切片后无内容: {meta.doc_name}")
 
         texts = [c.text for c in chunks]
 
         # 3. embed (only dense — sparse 由 Milvus BM25 Function 自动生成)
         dense_vecs = await dense_embedder.embed(texts)
 
+        # ★ 数量校验在删旧数据之前：嵌入部分失败（数量不符）时保留旧版本文档，
+        #   让本次入库失败可重试，而不是"旧的删了、新的进不去"
+        if len(dense_vecs) != len(texts):
+            raise RuntimeError(
+                f"嵌入数量不符: 预期 {len(texts)} 实际 {len(dense_vecs)}，"
+                f"保留旧版本数据: {meta.doc_name}"
+            )
+
         # 幂等：解析/切片/嵌入全部成功后才删旧数据，失败时保留旧版本文档
-        self.milvus.delete(
+        await asyncio.to_thread(
+            self.milvus.delete,
             collection_name=COLLECTION_NAME,
-            filter=f'doc_id == "{doc_id}"',
+            filter=f'doc_id == "{escape_milvus_string(doc_id)}"',
         )
 
         # 4. index (batch=50)
@@ -399,7 +413,9 @@ class IngestionPipeline:
                 all_data.append(record)
 
         if all_data:
-            self.milvus.insert(collection_name=COLLECTION_NAME, data=all_data)
+            await asyncio.to_thread(
+                self.milvus.insert, collection_name=COLLECTION_NAME, data=all_data,
+            )
             logger.info(f"入库完成: {meta.doc_name} doc_id={doc_id} chunks={len(all_data)}")
 
         return doc_id
@@ -463,7 +479,7 @@ class IngestionPipeline:
         # 在对应公式后插入原图引用
         out: list[str] = []
         pos = 0
-        for start, end, ref in sorted(refs):
+        for _start, end, ref in sorted(refs):
             out.append(md_text[pos:end])
             out.append(f"\n\n{ref}\n")
             pos = end
@@ -635,8 +651,8 @@ class IngestionPipeline:
                 f"images/{doc_id}/{kind}/"
                 f"p{page_idx}_{int(rect.y0)}_{int(rect.x0)}.png"
             )
-            ensure_bucket_exists()
-            upload_file(object_name, png_bytes, content_type="image/png")
+            await asyncio.to_thread(ensure_bucket_exists)
+            await asyncio.to_thread(upload_file, object_name, png_bytes, "image/png")
 
             scheme = "https" if settings.MINIO_SECURE else "http"
             minio_url = (
@@ -658,7 +674,7 @@ class IngestionPipeline:
         """上传图片到 MinIO；开启 VL 时用 qwen-vl-max 生成图片描述，
         替换 markdown 中 `![](images/xxx.jpg)` 为 `![描述](minio_url)`；
         未被 markdown 引用的"孤儿图"追加到文档末尾，保证图片内容也可被检索。"""
-        ensure_bucket_exists()
+        await asyncio.to_thread(ensure_bucket_exists)
         orphaned: list[str] = []  # 追加用的 ![描述](url) 片段
         for img_name, img_bytes in images.items():
             # 确定 content_type
@@ -673,7 +689,7 @@ class IngestionPipeline:
 
             object_name = f"images/{doc_id}/{img_name}"
             try:
-                upload_file(object_name, img_bytes, content_type=content_type)
+                await asyncio.to_thread(upload_file, object_name, img_bytes, content_type)
             except Exception as e:
                 logger.error(f"图片上传 MinIO 失败 {object_name}: {e}")
                 continue

@@ -1,13 +1,14 @@
 # ============================================================
-# rd-knowledge-svc 依赖
+# rd-knowledge-svc 依赖（生产）
 #
-# 与项目一 rd-agent-platform 保持版本一致，已验证跑通。
-# 项目二不做 Agent，去掉 langgraph-checkpoint-redis。
+# 版本与项目一 rd-agent-platform 对齐，已验证跑通。
+# 测试依赖在 requirements-dev.txt；安装：pip install -r requirements.txt -r requirements-dev.txt
+# ★ pymupdf / litellm 是隐性必需：前者被 pipeline 的表格/公式原图裁剪延迟导入，
+#   缺失时该功能静默关闭；后者是 trulens litelern provider 的底层依赖。
 # ============================================================
 
 # ---------------- Web 框架 ----------------
 fastapi==0.135.1
-aiofiles==25.1.0
 uvicorn==0.42.0
 python-multipart==0.0.22
 sse-starlette==3.3.4
@@ -24,11 +25,6 @@ SQLAlchemy==2.0.48
 asyncpg==0.30.0
 greenlet==3.3.2
 alembic==1.18.4
-psycopg2-binary==2.9.11
-
-# ---------------- 测试 ----------------
-pytest==9.0.2
-pytest-asyncio==1.3.0
 
 # ---------------- Neo4j ----------------
 neo4j==5.28.2
@@ -42,31 +38,22 @@ redis==7.3.0
 # ---------------- 可观测性 ----------------
 prometheus-client==0.25.0
 
-# ---------------- LangChain / LangGraph ----------------
+# ---------------- LangChain ----------------
 langchain==1.2.15
 langchain-core==1.2.28
 langchain-community==0.4.1
 langchain-experimental==0.4.1
 langchain-openai==1.1.12
-langchain-deepseek==1.0.1
-langgraph==1.1.6
-langgraph-checkpoint==4.0.1
-langgraph-prebuilt==1.0.9
 dashscope==1.25.16
 
 # ---------------- MinIO + 文档解析 ----------------
 minio==7.2.18
 pypdf==6.10.0
-pandas==2.3.3
-
-# ---------------- NL2SQL（AST 层 SQL 注入）----------------
+pymupdf==1.26.7        # 表格/公式 bbox 原图裁剪（缺失时该功能静默关闭）
 
 # ---------------- 评测（TruLens）----------------
-trulens>=2.9.0
-
-# ---------------- NL2SQL RAG 流水线 ----------------
-elasticsearch==8.15.1
-pyyaml==6.0.2
+trulens>=2.9.0                        # meta 包：trulens.core / trulens.apps / dashboard
+trulens-providers-litellm>=2.9.0      # litellm 裁判 provider（含 litellm 传递依赖）
 
 # ---------------- MinerU 轮询 ----------------
 aiohttp==3.13.3

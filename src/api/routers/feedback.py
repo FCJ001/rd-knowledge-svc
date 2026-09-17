@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.base_schema import ResponseSchema
+from src.core.deps import UserContext, get_current_user
 from src.infra.db import get_db
 from src.knowledge.feedbacks import (
     collect_feedback,
@@ -22,7 +23,6 @@ router = APIRouter(prefix="/api/v1/feedback", tags=["用户反馈"])
 
 
 class FeedbackRequest(BaseModel):
-    user_id: str = Field(default="anonymous", description="用户标识")
     question: str = Field(default="", description="用户问题")
     answer_preview: str = Field(default="", description="答案摘要")
     rating: int = Field(..., ge=-1, le=1, description="1=赞, -1=踩, 0=中性")
@@ -35,12 +35,14 @@ class FeedbackRequest(BaseModel):
 @router.post("", response_model=ResponseSchema[dict])
 async def submit_feedback(
     req: FeedbackRequest,
+    user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """提交用户反馈"""
+    """提交用户反馈。user_id 取自身份上下文（header 模式取 X-User-Id，jwt 模式取 claims），
+    不再信任请求体自报的身份。"""
     fb = await collect_feedback(
         db=db,
-        user_id=req.user_id,
+        user_id=user.user_id or "anonymous",
         question=req.question,
         answer_preview=req.answer_preview,
         rating=req.rating,

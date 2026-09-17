@@ -18,6 +18,9 @@ def _get_llm() -> ChatOpenAI:
         api_key=settings.DASHSCOPE_API_KEY,
         base_url=settings.BASE_URL_CHAT,
         temperature=0,
+        # ★ 客户端层超时 + 有限重试：LLM 端挂起时请求能失败而非永久挂死
+        request_timeout=settings.LLM_REQUEST_TIMEOUT,
+        max_retries=2,
     )
 
 
@@ -29,6 +32,8 @@ def _get_llm_deepseek() -> ChatOpenAI:
         api_key=settings.DEEPSEEK_API_KEY,
         base_url="https://api.deepseek.com/v1",
         temperature=0,
+        request_timeout=settings.LLM_REQUEST_TIMEOUT,
+        max_retries=2,
     )
 
 

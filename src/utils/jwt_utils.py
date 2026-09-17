@@ -1,22 +1,27 @@
 # ============================================================
 # JWT 工具 — 只验签不签发
 #
-# 项目二的 token 由项目一或 Java 网关签发（RS256），
-# 本服务只负责验证。开发期走 header mock，不验签。
+# token 由上游（项目一或 Java 网关）签发，本服务只负责验证：
+#   - RS256（非对称）：配 JWT_PUBLIC_KEY（推荐，本服务不持有签发能力）
+#   - HS256（对称）：配 JWT_SECRET
+# ★ 密钥一律从环境注入（.env / KMS），绝不在代码里硬编码
 # ============================================================
 
 import jwt
 
-SECRET_KEY = "12af38e3ab85909849bfe0b89f89075d7677438a0f14c0304a46249ae513558d"
-ALGORITHM = "HS256"
+from src.core.config import get_settings
 
 
 def verify_jwt(token: str) -> dict:
-    """验证 JWT token，返回 payload"""
-    try:
-        payload = jwt.decode(token, key=SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise Exception("token已过期")
-    except jwt.InvalidTokenError:
-        raise Exception("非法token")
+    """验证 JWT token，返回 payload。失败抛 jwt.InvalidTokenError 系异常。"""
+    settings = get_settings()
+    key = settings.JWT_PUBLIC_KEY if settings.JWT_ALGORITHM.upper() == "RS256" else settings.JWT_SECRET
+    if not key:
+        # 拒绝用空密钥验签（等于不设防），由调用方转 401
+        raise jwt.InvalidTokenError("JWT 验签密钥未配置（JWT_SECRET / JWT_PUBLIC_KEY）")
+    return jwt.decode(
+        token,
+        key=key,
+        algorithms=[settings.JWT_ALGORITHM],
+        options={"require": ["exp"]},  # 必须带过期时间
+    )

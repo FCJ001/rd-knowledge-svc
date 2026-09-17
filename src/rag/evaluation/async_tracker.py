@@ -25,7 +25,6 @@ from src.core.config import get_settings
 from src.core.logger import logger
 from src.rag.evaluation.nl2sql_metrics import score_sql_valid
 
-
 # ── RAG Triad 中文 LLM-as-Judge prompts ────────────────────────────
 # 使用 0.0-1.0 连续评分，要求 LLM 使用全范围，避免中庸
 
@@ -111,7 +110,9 @@ class AsyncEvaluator:
         settings = get_settings()
         self.enabled = settings.TRULENS_ENABLED
         self.sample_rate = settings.EVAL_SAMPLE_RATE
-        self._table_ready = False  # 同一进程只建表/加列一次，避免每条评分都跑 13 条 DDL
+        self._table_ready = False  # 同一进程只建表/加列一次，避免每条评分都跑一遍 DDL
+        # ★ 持有后台任务引用：create_task 返回值被丢弃的任务可能被 GC 中途回收
+        self._bg_tasks: set[asyncio.Task] = set()
 
         if self.enabled:
             self._llm = ChatOpenAI(
@@ -119,6 +120,8 @@ class AsyncEvaluator:
                 api_key=settings.DASHSCOPE_API_KEY,
                 base_url=settings.BASE_URL_CHAT,
                 temperature=0,
+                request_timeout=settings.LLM_REQUEST_TIMEOUT,
+                max_retries=2,
             )
             self._engine = create_async_engine(
                 f"postgresql+asyncpg://{settings.DB_USER}:{settings.DB_PASSWORD}"
@@ -135,6 +138,12 @@ class AsyncEvaluator:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    def _spawn(self, coro) -> None:
+        """创建后台任务并持有引用，结束时自动移除（防任务被 GC 中途回收）"""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def _ensure_table(self, conn) -> None:
         """建表 + 兼容旧表加列。只在首次写库前执行一次，避免每条评分重复跑 13 条 DDL。"""
@@ -163,6 +172,7 @@ class AsyncEvaluator:
                 token_output INTEGER DEFAULT 0,
                 token_calls INTEGER DEFAULT 0,
                 token_cost_usd REAL DEFAULT 0,
+                latency_ms REAL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """))
@@ -179,6 +189,7 @@ class AsyncEvaluator:
             "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_output INTEGER DEFAULT 0",
             "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_calls INTEGER DEFAULT 0",
             "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS token_cost_usd REAL DEFAULT 0",
+            "ALTER TABLE online_scores ADD COLUMN IF NOT EXISTS latency_ms REAL DEFAULT 0",
         ]:
             try:
                 await conn.execute(text(col_sql))
@@ -194,6 +205,7 @@ class AsyncEvaluator:
         summary: str = "",
         error: str | None = None,
         token_usage: dict | None = None,
+        latency_ms: float = 0,
     ):
         """fire-and-forget：按采样率随机决定是否打分"""
         if not self.enabled:
@@ -210,8 +222,9 @@ class AsyncEvaluator:
             "data": data or [],
             "row_count": len(data) if data else 0,
             "token_usage": token_usage or {},
+            "latency_ms": latency_ms,
         }
-        asyncio.create_task(self._run(ctx))
+        self._spawn(self._run(ctx))
 
     async def _run(self, ctx: dict):
         """后台任务：跑 NL2SQL 三指标 → 写入 trulens_eval"""
@@ -263,9 +276,9 @@ class AsyncEvaluator:
                         INSERT INTO online_scores
                             (eval_type, question, sql, summary, error,
                              score_sql_valid, score_has_data, score_relevance, score_reason,
-                             token_input, token_output, token_calls, token_cost_usd)
+                             token_input, token_output, token_calls, token_cost_usd, latency_ms)
                         VALUES ('nl2sql', :q, :sql, :summary, :error, :sql_ok, :has_data, :relevance, :reason,
-                                :token_input, :token_output, :token_calls, :token_cost_usd)
+                                :token_input, :token_output, :token_calls, :token_cost_usd, :latency_ms)
                     """),
                     {
                         "q": ctx["question"][:500],
@@ -280,6 +293,7 @@ class AsyncEvaluator:
                         "token_output": ctx.get("token_usage", {}).get("output_tokens", 0),
                         "token_calls": ctx.get("token_usage", {}).get("calls", 0),
                         "token_cost_usd": ctx.get("token_usage", {}).get("cost_usd", 0),
+                        "latency_ms": ctx.get("latency_ms", 0),
                     },
                 )
             logger.info(
@@ -291,7 +305,8 @@ class AsyncEvaluator:
 
     # ── 知识检索评估 ────────────────────────────────────────────────
 
-    def evaluate_knowledge(self, question: str, answer: str, contexts: list[str] | None = None, token_usage: dict | None = None):
+    def evaluate_knowledge(self, question: str, answer: str, contexts: list[str] | None = None,
+                           token_usage: dict | None = None, latency_ms: float = 0):
         """fire-and-forget：评估知识检索 RAG Triad（答案相关性 + 上下文相关性 + 有据性）"""
         if not self.enabled:
             return
@@ -304,8 +319,9 @@ class AsyncEvaluator:
             "answer": answer,
             "contexts": contexts or [],
             "token_usage": token_usage or {},
+            "latency_ms": latency_ms,
         }
-        asyncio.create_task(self._run_knowledge(ctx))
+        self._spawn(self._run_knowledge(ctx))
 
     async def _run_knowledge(self, ctx: dict):
         """后台任务：LLM 裁判 RAG Triad → 写入 trulens_eval"""
@@ -399,12 +415,12 @@ class AsyncEvaluator:
                              score_relevance, score_reason,
                              score_context_relevance, score_context_relevance_reason,
                              score_groundedness, score_groundedness_reason,
-                             token_input, token_output, token_calls, token_cost_usd)
+                             token_input, token_output, token_calls, token_cost_usd, latency_ms)
                         VALUES ('knowledge', :q, :answer,
                                 :rel, :rel_reason,
                                 :ctx_rel, :ctx_rel_reason,
                                 :gnd, :gnd_reason,
-                                :token_input, :token_output, :token_calls, :token_cost_usd)
+                                :token_input, :token_output, :token_calls, :token_cost_usd, :latency_ms)
                     """),
                     {
                         "q": ctx["question"][:500],
@@ -419,6 +435,7 @@ class AsyncEvaluator:
                         "token_output": ctx.get("token_usage", {}).get("output_tokens", 0),
                         "token_calls": ctx.get("token_usage", {}).get("calls", 0),
                         "token_cost_usd": ctx.get("token_usage", {}).get("cost_usd", 0),
+                        "latency_ms": ctx.get("latency_ms", 0),
                     },
                 )
             logger.info(
@@ -432,6 +449,9 @@ class AsyncEvaluator:
             logger.warning(f"[AsyncEvaluator] 写入知识评分失败: {e}")
 
     async def close(self):
+        """lifespan shutdown 调用：等在途评分任务收尾后释放引擎"""
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         if self.enabled and hasattr(self, "_engine"):
             await self._engine.dispose()
 

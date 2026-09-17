@@ -11,15 +11,17 @@
 
 from __future__ import annotations
 
+import time
+
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
 from src.core.config import get_settings
-from src.core.metrics import LLM_CALLS, LLM_TOKENS
+from src.core.metrics import LLM_CALLS, LLM_LATENCY, LLM_TOKENS
 
 
 class TokenTracker(BaseCallbackHandler):
-    """LangChain 回调，累计 Token 用量和费用"""
+    """LangChain 回调，累计 Token 用量、费用与调用耗时"""
 
     def __init__(self, model: str | None = None):
         super().__init__()
@@ -30,12 +32,21 @@ class TokenTracker(BaseCallbackHandler):
         self._input_tokens = 0
         self._output_tokens = 0
         self._calls = 0
+        self._start_times: dict[str, float] = {}  # run_id → 调用起点
 
     # ── LangChain callback interface ─────────────────────────────────
 
-    def on_llm_end(self, response: LLMResult, **kwargs) -> None:
+    def on_llm_start(self, serialized, prompts, *, run_id=None, **kwargs) -> None:
+        """记录调用起点，供 on_llm_end 计算耗时"""
+        if run_id is not None:
+            self._start_times[str(run_id)] = time.perf_counter()
+
+    def on_llm_end(self, response: LLMResult, *, run_id=None, **kwargs) -> None:
         """LLM 调用结束，提取 token 用量并埋入 Prometheus 指标"""
         self._calls += 1
+        start = self._start_times.pop(str(run_id), None) if run_id is not None else None
+        if start is not None:
+            LLM_LATENCY.labels(model=self._model).observe(time.perf_counter() - start)
         input_tokens = output_tokens = 0
         if response.llm_output and "token_usage" in response.llm_output:
             model_name = response.llm_output.get("model_name")

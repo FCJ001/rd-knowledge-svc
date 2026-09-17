@@ -58,11 +58,38 @@ def build_search_cache_key(
     model_code: str,
     use_hyde: bool,
     role: str,
+    owner_domain_id: int | None = None,
+    business_line: str | None = None,
 ) -> str:
-    """知识检索缓存 key。role 参与 key（影响 NL2SQL 行过滤），user 不参与（跨用户复用）。"""
+    """知识检索缓存 key。
+
+    ★ role / owner_domain_id / business_line 必须参与 key：
+      nl2sql 通道结果按这三个维度做行级过滤，缺了任何一个都会把
+      A 域的查询结果缓存给 B 域用户（跨身份数据泄漏）。
+    user_id 不参与（同域同角色下跨用户复用）。"""
     import hashlib
 
-    payload = f"{question}|{sorted(channels)}|{doc_type}|{model_code}|{use_hyde}|{role}"
+    payload = (
+        f"{question}|{sorted(channels)}|{doc_type}|{model_code}|{use_hyde}|{role}"
+        f"|{owner_domain_id}|{business_line}"
+    )
     digest = hashlib.md5(payload.encode("utf-8")).hexdigest()
-    # v2：image_urls 语义改为"答案引用的图片"，旧缓存全部失效
-    return f"alm_cache:search:v2:{digest}"
+    # v3：key 加入行级过滤维度（v2 及以前不同域可能命中同一缓存，必须全部失效）
+    return f"alm_cache:search:v3:{digest}"
+
+
+async def invalidate_search_cache() -> int:
+    """文档增删后失效全部检索缓存（SCAN 逐个删除，避免 KEYS 阻塞）。
+
+    fail-open：Redis 异常只记日志，靠 TTL 兜底。返回删除数量。"""
+    if not settings.QUERY_CACHE_ENABLED:
+        return 0
+    deleted = 0
+    try:
+        client = _client()
+        async for key in client.scan_iter(match="alm_cache:search:v3:*", count=200):
+            await client.delete(key)
+            deleted += 1
+    except Exception as e:
+        logger.warning(f"检索缓存失效失败（等 TTL 过期兜底）: {e}")
+    return deleted

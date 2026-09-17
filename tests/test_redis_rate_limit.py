@@ -4,7 +4,6 @@
 # 窗口语义本身由 SlidingWindowRateLimiter（内存版）测试覆盖。
 # ============================================================
 
-import pytest
 
 from src.core.cache import build_search_cache_key
 from src.core.rate_limit import RedisSlidingWindowRateLimiter

@@ -2,7 +2,7 @@
 # 统一响应结构
 # ============================================================
 
-from typing import Generic, Optional, TypeVar
+from typing import Generic, TypeVar
 
 from pydantic import BaseModel
 
@@ -12,8 +12,8 @@ T = TypeVar("T")
 class ResponseSchema(BaseModel, Generic[T]):
     code: int = 200
     message: str = "success"
-    data: Optional[T] = None
-    trace_id: Optional[str] = None
+    data: T | None = None
+    trace_id: str | None = None
 
 
 class PageResult(BaseModel, Generic[T]):

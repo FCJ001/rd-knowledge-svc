@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections.abc import Callable
 
 import httpx
@@ -21,8 +22,8 @@ from neo4j import AsyncDriver
 from pymilvus import MilvusClient
 
 from src.core.config import get_settings
-from src.core.metrics import RETRIEVAL_REQUESTS
-from src.core.resilience import with_retry, get_channel_breaker
+from src.core.metrics import RETRIEVAL_LATENCY, RETRIEVAL_REQUESTS
+from src.core.resilience import get_channel_breaker, with_retry
 from src.knowledge.doc_rag import extract_image_urls, format_doc_context, search_docs_raw
 from src.knowledge.graph_rag import search_graph_raw
 from src.knowledge.hallucination_check import check_hallucination
@@ -35,7 +36,7 @@ _settings = get_settings()
 def _chatbi_headers(
     role: str, owner_domain_id: int | None, business_line: str | None
 ) -> dict:
-    """ChatBI 请求头：身份 + 行级过滤参数 + 数据源路由"""
+    """ChatBI 请求头：身份 + 行级过滤参数 + 数据源路由 + trace 透传（跨服务链路串联）"""
     headers = {
         "X-User-Id": "knowledge-svc",
         "X-User-Role": role,
@@ -45,6 +46,10 @@ def _chatbi_headers(
         headers["X-Owner-Domain-Id"] = str(owner_domain_id)
     if business_line:
         headers["X-Business-Line"] = business_line
+    from src.core.logger import trace_id_var
+    trace_id = trace_id_var.get()
+    if trace_id and trace_id != "-":
+        headers["X-Trace-Id"] = trace_id
     return headers
 
 
@@ -130,23 +135,28 @@ async def _run_channel(key: str, factory: Callable[[], object]) -> object:
 
     - 熔断器 open 时直接抛错（快速失败），不再发起调用；
     - 临时失败按 RETRIEVAL_CHANNEL_RETRIES 次指数退避重试；
-    - 单次执行受 RETRIEVAL_CHANNEL_TIMEOUT 限制，超时按失败降级。
+    - 单次执行受 RETRIEVAL_CHANNEL_TIMEOUT 限制，超时按失败降级；
+    - 通道耗时落 RETRIEVAL_LATENCY 直方图（慢通道可量化）。
     """
     breaker = get_channel_breaker(key)
+    start = time.perf_counter()
 
     # 顺序：熔断(外) → 退避重试(中) → 单次超时(内)
     async def attempt() -> object:
         return await asyncio.wait_for(factory(), timeout=_settings.RETRIEVAL_CHANNEL_TIMEOUT)
 
-    return await breaker.call(
-        lambda: with_retry(
-            attempt,
-            attempts=_settings.RETRIEVAL_CHANNEL_RETRIES,
-            base_delay=0.3,
-            retry_on=(Exception, asyncio.TimeoutError),
-            task=f"channel:{key}",
+    try:
+        return await breaker.call(
+            lambda: with_retry(
+                attempt,
+                attempts=_settings.RETRIEVAL_CHANNEL_RETRIES,
+                base_delay=0.3,
+                retry_on=(Exception, asyncio.TimeoutError),
+                task=f"channel:{key}",
+            )
         )
-    )
+    finally:
+        RETRIEVAL_LATENCY.labels(channel=key).observe(time.perf_counter() - start)
 
 
 async def _generate_answer(
@@ -158,18 +168,23 @@ async def _generate_answer(
 
     event_sink 存在时用 astream 逐 token 推送 {"type":"delta","content":...}，
     供 SSE 流式消费；否则 ainvoke 一次性返回（保持原有行为）。
+    ★ 整体受 GENERATION_TIMEOUT 约束：LLM 端挂起时快速失败，
+      而不是让 /search 或 SSE 永不返回。
     """
     messages = [SystemMessage(content=prompt)]
     if event_sink is None:
-        response = await llm.ainvoke(messages)
+        response = await asyncio.wait_for(
+            llm.ainvoke(messages), timeout=_settings.GENERATION_TIMEOUT,
+        )
         return response.content
 
     answer_parts = []
-    async for chunk in llm.astream(messages):
-        content = getattr(chunk, "content", None)
-        if content:
-            answer_parts.append(content)
-            event_sink({"type": "delta", "content": content})
+    async with asyncio.timeout(_settings.GENERATION_TIMEOUT):
+        async for chunk in llm.astream(messages):
+            content = getattr(chunk, "content", None)
+            if content:
+                answer_parts.append(content)
+                event_sink({"type": "delta", "content": content})
     return "".join(answer_parts)
 
 
@@ -354,7 +369,15 @@ async def multi_channel_search(
     _emit(event_sink, {"type": "done", "answer": answer, "contexts": retrieved_chunks, "image_urls": image_urls})
 
     evidence = "\n".join(evidence_parts)
-    hal_result = await check_hallucination(question, evidence, answer, llm)
+    # 幻觉检测 fail-open：超时/异常一律放行，不阻塞答案返回
+    try:
+        hal_result = await asyncio.wait_for(
+            check_hallucination(question, evidence, answer, llm),
+            timeout=_settings.HALLUCINATION_TIMEOUT,
+        )
+    except TimeoutError:
+        logger.warning(f"幻觉检测超时（{_settings.HALLUCINATION_TIMEOUT}s），fail-open 放行")
+        hal_result = {"is_grounded": True, "unsupported_claims": []}
     if not hal_result["is_grounded"]:
         claims = "、".join(hal_result.get("unsupported_claims", []))
         answer += f"\n\n⚠️ 提示：以下内容未在手册中完全印证：{claims}"

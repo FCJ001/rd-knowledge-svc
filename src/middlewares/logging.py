@@ -2,6 +2,7 @@
 # 请求日志中间件 + trace_id 全链路透传
 # ============================================================
 
+import re
 import time
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -9,10 +10,14 @@ from starlette.requests import Request
 
 from src.core.logger import logger, new_trace_id, trace_id_var
 
+# 外部传入的 X-Trace-Id 必须过白名单：防超长/特殊字符污染日志与审计存储
+_TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
 
 class TraceLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        trace_id = request.headers.get("X-Trace-Id") or new_trace_id()
+        incoming = request.headers.get("X-Trace-Id") or ""
+        trace_id = incoming if _TRACE_ID_RE.match(incoming) else new_trace_id()
         token = trace_id_var.set(trace_id)
 
         start = time.perf_counter()
