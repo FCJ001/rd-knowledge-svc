@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     JWT_SECRET: str = ""                  # HS256 验签密钥（AUTH_MODE=jwt 时必填，禁止硬编码）
     JWT_PUBLIC_KEY: str = ""              # RS256 公钥（PEM，上游网关签发时用）
     JWT_ALGORITHM: str = "HS256"          # HS256 / RS256
+    GATEWAY_TRUSTED: bool = False         # header 模式下声明"网关已剥离外部 X-User-* 同名头"（prod 必须显式 true）
+    JWT_REVOKED_SECRETS: str = ""         # 已泄露历史密钥黑名单（逗号分隔；部署侧注入，源码不落密钥字面量）
 
     # ---------------- 跨域 ----------------
     CORS_ORIGINS: str = "*"               # 逗号分隔的显式 origin 列表；生产必须收敛
@@ -75,16 +77,19 @@ class Settings(BaseSettings):
     NEO4J_QUERY_TIMEOUT: float = 10.0       # 单条 Cypher 执行超时（秒）
 
     # ---------------- 模型 ----------------
-    DASHSCOPE_API_KEY: str = ""
-    BASE_URL_CHAT: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    CHAT_MODEL: str = "qwen-max"
-    EMBEDDING_MODEL: str = "text-embedding-v3"
+    # ★ 主链路（生成/改写/HyDE/GraphRAG/幻觉检测/VL 摘要/LLM 重排/评测裁判）统一走
+    #   DeepSeek 的 OpenAI 兼容端点；仅向量化（embedding/语义分块）保留 DashScope。
+    DASHSCOPE_API_KEY: str = ""           # 仅向量化（EMBEDDING_MODEL）使用
+    BASE_URL_CHAT: str = "https://api.deepseek.com/v1"
+    CHAT_MODEL: str = "deepseek-chat"     # 可换 deepseek-reasoner（推理模型，延迟更高）
+    EMBEDDING_MODEL: str = "text-embedding-v3"  # DashScope 向量化，不随主链路切换
 
-    DEEPSEEK_API_KEY: str = ""
-    DEEPSEEK_MODEL: str = "deepseek-chat"
+    DEEPSEEK_API_KEY: str = ""            # 主链路密钥（CHAT_API_KEY 为空时回退到它）
+    CHAT_API_KEY: str = ""                # 显式指定主链路密钥（换 OpenAI 兼容供应商时用）
 
     # ---------------- MinerU ----------------
-    MINERU_API_URL: str = "http://117.50.195.135:8000"
+    # ★ 解析服务地址必须由部署环境显式提供，代码不设业务默认值（prod 校验强制）
+    MINERU_API_URL: str = "http://localhost:8000"
     MINERU_BACKEND: str = "hybrid-auto-engine"
     MINERU_TIMEOUT: int = 300
     # ---------------- RAG ----------------
@@ -98,6 +103,7 @@ class Settings(BaseSettings):
     RAG_HYBRID_ENABLED: bool = False
     RAG_DYNAMIC_TOPK: bool = True  # Rerank 后按分数断崖动态截断（最多 10 条）
     RERANK_TIMEOUT: float = 10.0   # 精排调用超时（秒），超时回退向量距离排序
+    RERANK_PROVIDER: str = "deepseek"  # deepseek=LLM 清单式重排 / dashscope=qwen3-rerank 专用模型 / off=RRF 序直通
 
     # ---------------- LLM 超时 ----------------
     LLM_REQUEST_TIMEOUT: float = 120.0    # 单次 LLM HTTP 请求超时（openai 客户端层）
@@ -105,7 +111,14 @@ class Settings(BaseSettings):
     HALLUCINATION_TIMEOUT: float = 30.0   # 幻觉检测超时（秒），fail-open
 
     # ---------------- 图片 VL 摘要 ----------------
-    VL_MODEL: str = "qwen-vl-max"
+    # DeepSeek 视觉模型 deepseek-flash：OpenAI 兼容 image_url 协议，
+    # 图片只允许出现在 user 消息里，单图 ≤32MiB（入库页图裁剪远小于此）
+    VL_MODEL: str = "deepseek-flash"
+    VL_BASE_URL: str = "https://api.deepseek.com/v1"
+    VL_API_KEY: str = ""                  # 空则回退主链路密钥（chat_api_key）
+    VL_TIMEOUT: float = 60.0              # 单张图片 VL 调用超时（秒），超时按无摘要处理
+    VL_CONCURRENCY: int = 2               # VL 并发调用上限（批量入库时限流，防上游 429）
+    EMBED_CONCURRENCY: int = 2            # embedding 并发调用上限（批量入库时限流）
     IMAGE_SUMMARIZE_ENABLED: bool = True  # 入库时对每张图片调用 VL 生成描述写入 markdown
 
     # ---------------- 公式原图对照（双通道）----------------
@@ -119,6 +132,10 @@ class Settings(BaseSettings):
     # 嵌入 markdown 表格下方供人眼对照，防复杂表格（colspan/rowspan）OCR 串行/丢列。
     # 跨页表格每个页片段一块，续页块（table_body=None）归并到上一块。
     TABLE_ORIGINALS_ENABLED: bool = True
+    # 入库时对每张表格原图调用 VL：生成一句话语义摘要（写入 chunk 可检索文本，
+    # 让"拧多紧"这类语义化提问能召回表格）+ 净化 Markdown 转录（与 MinerU HTML
+    # 并排互查）；失败 fail-open 保留原样，单表失败不影响其他表
+    TABLE_VL_ENABLED: bool = True
 
     # ---------------- API 限流 ----------------
     RATE_LIMIT_ENABLED: bool = True
@@ -139,6 +156,8 @@ class Settings(BaseSettings):
     INGEST_CONSUMER_GROUP: str = "alm_ingest_workers"  # 消费者组
     INGEST_STREAM_MAX_LEN: int = 1000             # Stream 最大保留消息数
     INGEST_MAX_RETRIES: int = 2                   # worker 处理失败重试次数
+    INGEST_CONCURRENCY: int = 1                   # worker 单进程并发处理消息数（横向扩容=多起 worker 进程）
+    INGEST_PEL_MIN_IDLE_S: int = 1800             # PEL 回收认领阈值（秒），必须大于单条消息最长处理时间
 
     # ---------------- 韧性（超时/重试/熔断）----------------
     RETRIEVAL_CHANNEL_TIMEOUT: int = 20   # 单检索通道超时（秒），超时按失败降级
@@ -161,15 +180,19 @@ class Settings(BaseSettings):
 
     # ---------------- 在线评测采样 ----------------
     EVAL_SAMPLE_RATE: float = 0.1  # 在线 LLM-as-Judge 采样率，0.1 = 10%
+    JUDGE_MODEL: str = ""          # 裁判模型；空则跟随 CHAT_MODEL（换独立模型消除自评偏差）
 
     # ---------------- Guardrails ----------------
     GUARDRAILS_ENABLED: bool = True
     GUARDRAILS_BLOCK_DDL: bool = True  # 拦截 DROP/TRUNCATE/ALTER
     GUARDRAILS_BLOCK_DML_WITHOUT_WHERE: bool = True  # 拦截无 WHERE 的 DELETE/UPDATE
 
-    # ---------------- 模型定价（USD/1M tokens）----------------
-    MODEL_PRICING_INPUT: float = 0.4   # qwen-max 输入 $0.4/1M
-    MODEL_PRICING_OUTPUT: float = 1.2  # qwen-max 输出 $1.2/1M
+    # ---------------- 模型定价（USD/1M tokens，成本核算用）----------------
+    # deepseek-flash 峰时参考价（输入未命中缓存 $0.30 / 输出 $1.20）；
+    # 谷时减半、缓存命中更低，精确计费以价目页为准：
+    # https://api-docs.deepseek.com/quick_start/pricing
+    MODEL_PRICING_INPUT: float = 0.30
+    MODEL_PRICING_OUTPUT: float = 1.20
 
     # ---------------- 日志 ----------------
     LOG_LEVEL: str = "INFO"
@@ -188,10 +211,22 @@ class Settings(BaseSettings):
                 problems.append("APP_DEBUG 必须为 false")
             if self.AUTH_MODE == "jwt" and not (self.JWT_SECRET or self.JWT_PUBLIC_KEY):
                 problems.append("AUTH_MODE=jwt 时必须配置 JWT_SECRET 或 JWT_PUBLIC_KEY")
-            if self.JWT_SECRET == "12af38e3ab85909849bfe0b89f89075d7677438a0f14c0304a46249ae513558d":
-                problems.append("JWT_SECRET 是已泄露的旧密钥，必须更换")
+            revoked = {s.strip() for s in self.JWT_REVOKED_SECRETS.split(",") if s.strip()}
+            if self.JWT_SECRET and self.JWT_SECRET in revoked:
+                problems.append("JWT_SECRET 命中已泄露密钥黑名单（JWT_REVOKED_SECRETS），必须更换")
+            if self.AUTH_MODE == "header" and not self.GATEWAY_TRUSTED:
+                problems.append(
+                    "AUTH_MODE=header 依赖网关剥离外部 X-User-* 同名头；"
+                    "确认网关已剥离后显式设置 GATEWAY_TRUSTED=true，否则改用 AUTH_MODE=jwt"
+                )
             if self.CORS_ORIGINS.strip() == "*":
                 problems.append("CORS_ORIGINS 必须收敛为显式 origin 列表")
+            if self.DB_PASSWORD == "rdagent123" or self.NEO4J_PASSWORD == "rdagent123":
+                problems.append("DB_PASSWORD/NEO4J_PASSWORD 不能使用开发默认密码")
+            if self.MINIO_ACCESS_KEY == "minioadmin" or self.MINIO_SECRET_KEY == "minioadmin":
+                problems.append("MINIO_ACCESS_KEY/MINIO_SECRET_KEY 不能使用开发默认值")
+            if "MINERU_API_URL" not in self.model_fields_set:
+                problems.append("MINERU_API_URL 必须由部署环境显式提供（不入代码默认值）")
             if problems:
                 raise ValueError(f"生产配置校验失败: {'; '.join(problems)}")
         return self
@@ -208,6 +243,16 @@ class Settings(BaseSettings):
     def REDIS_URL(self) -> str:
         auth = f":{self.REDIS_PASSWORD}@" if self.REDIS_PASSWORD else ""
         return f"redis://{auth}{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+
+    @property
+    def chat_api_key(self) -> str:
+        """主链路（对话/生成/VL/重排/裁判）密钥：CHAT_API_KEY 优先，回退 DEEPSEEK_API_KEY"""
+        return self.CHAT_API_KEY or self.DEEPSEEK_API_KEY
+
+    @property
+    def vl_api_key(self) -> str:
+        """VL 密钥：VL_API_KEY 优先，回退主链路密钥"""
+        return self.VL_API_KEY or self.chat_api_key
 
     model_config = {
         "env_file": ".env",

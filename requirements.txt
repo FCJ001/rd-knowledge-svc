@@ -50,6 +50,7 @@ dashscope==1.25.16
 minio==7.2.18
 pypdf==6.10.0
 pymupdf==1.26.7        # 表格/公式 bbox 原图裁剪（缺失时该功能静默关闭）
+llama-index-core>=0.12.0   # 解析降级链兜底（SimpleDirectoryReader）；MinerU 为主解析，此为 fallback 依赖
 
 # ---------------- 评测（TruLens）----------------
 trulens>=2.9.0                        # meta 包：trulens.core / trulens.apps / dashboard

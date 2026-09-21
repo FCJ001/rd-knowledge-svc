@@ -1,7 +1,8 @@
 # ============================================================
-# 本地/预发一键编排：API + 入库 worker + 全部基础设施
-# 生产建议：基础设施用云托管实例，仅 api/worker 走容器编排（k8s）
-#
+# 本项目独立编排（与项目一 rd-agent 完全隔离的实例与数据卷）
+# 端口约定：错开本机已占用端口（5433/6380/7474/7687/9000/9091/9200/15432/16379/19091/19530/19531）
+#   postgres 15433 · redis 16380 · minio 9002(API)/9003(控制台)
+#   milvus 19540(健康检查 19092) · neo4j 7475(HTTP)/7688(Bolt) · api 8002
 # 启动：docker compose up -d --build
 # 注意：APP_ENV 非 prod 时为开发语义（header 认证、CORS 放开）
 # ============================================================
@@ -34,7 +35,6 @@ services:
       - "8002:8002"
     restart: unless-stopped
     # ★ 生产（APP_ENV=prod）：健康检查失败自动摘除重启
-
   worker:
     <<: *app-base
     command: ["python", "-m", "src.rag.ingestion.worker"]
@@ -42,6 +42,8 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    ports:
+      - "15433:5432"
     environment:
       POSTGRES_USER: rdagent
       POSTGRES_PASSWORD: ${DB_PASSWORD:-rdagent123}
@@ -58,6 +60,8 @@ services:
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "16380:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -74,7 +78,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
     ports:
-      - "9001:9001"
+      - "9002:9000"
+      - "9003:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -85,25 +90,51 @@ services:
     restart: unless-stopped
 
   milvus:
-    image: milvusdb/milvus:v2.6.10
+    image: milvusdb/milvus:v2.6.13
     command: ["milvus", "run", "standalone"]
+    # ★ 与本机已验证可用的部署形态一致：外置 etcd + 复用本 compose 的 minio + woodpecker MQ
+    #   （嵌入式 etcd + local storage 在 macOS/arm64 上启动即 OOM 崩溃，勿改回）
     environment:
-      ETCD_USE_EMBED: "true"
-      COMMON_STORAGETYPE: local
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MQ_TYPE: woodpecker
+      LD_PRELOAD: :/milvus/lib/libjemalloc.so
+      MALLOC_CONF: background_thread:true
+    mem_limit: 2g
     volumes:
       - milvus_data:/var/lib/milvus
     ports:
-      - "19530:19530"
+      - "19540:19530"
+      - "19092:9091"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 15s
       timeout: 10s
       retries: 10
-      start_period: 30s
+      start_period: 40s
+    restart: unless-stopped
+    depends_on:
+      etcd:
+        condition: service_started
+      minio:
+        condition: service_healthy
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+    command: ["etcd", "-advertise-client-urls=http://etcd:2379", "-listen-client-urls=http://0.0.0.0:2379", "--data-dir=/etcd"]
+    volumes:
+      - etcd_data:/etcd
     restart: unless-stopped
 
   neo4j:
     image: neo4j:5-community
+    ports:
+      - "7475:7474"
+      - "7688:7687"
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-rdagent123}
     volumes:
@@ -120,4 +151,5 @@ volumes:
   redis_data:
   minio_data:
   milvus_data:
+  etcd_data:
   neo4j_data:

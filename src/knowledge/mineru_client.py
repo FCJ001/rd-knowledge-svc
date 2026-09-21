@@ -2,7 +2,7 @@
 # MinerU 文档解析客户端
 #
 # 与天宫医疗配置一致：
-#   MINERU_API_URL=http://117.50.195.135:8000
+#   MINERU_API_URL=http://localhost:8000
 #   MINERU_BACKEND=hybrid-auto-engine
 #   MINERU_TIMEOUT=300
 #

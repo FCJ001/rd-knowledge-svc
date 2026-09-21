@@ -113,8 +113,8 @@ async def process_ingestion(
         doc.status = "indexed"
         doc.chunk_count = await _count_chunks(result_doc_id)
 
-    # 更新 job 完成
-    await _set_job(db, job_id, stage="index", progress=100, doc_id=result_doc_id)
+    # 更新 job 完成（★ 终态必须是 completed：前端/轮询方以 stage==completed 判定入库结束）
+    await _set_job(db, job_id, stage="completed", progress=100, doc_id=result_doc_id)
 
     logger.info(f"文档入库完成: {doc_name} → doc_id={result_doc_id}")
     return result_doc_id
@@ -141,7 +141,10 @@ async def _set_job(
 
 
 async def _count_chunks(doc_id: str) -> int:
-    """查 Milvus 统计 chunk 数（同步 gRPC 调用放线程池，不阻塞事件循环）"""
+    """查 Milvus 统计 chunk 数（同步 gRPC 调用放线程池，不阻塞事件循环）。
+
+    ★ consistency_level=Strong：刚 insert 的数据在默认 Bounded 一致性下可能读不到，
+      会把 chunk_count 落成 0。"""
     assert_valid_doc_id(doc_id)
     milvus = get_milvus_client()
     results = await asyncio.to_thread(
@@ -149,6 +152,7 @@ async def _count_chunks(doc_id: str) -> int:
         collection_name="alm_docs",
         filter=f'doc_id == "{escape_milvus_string(doc_id)}"',
         output_fields=["id"],
+        consistency_level="Strong",
     )
     return len(results)
 

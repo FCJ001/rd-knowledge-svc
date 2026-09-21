@@ -33,3 +33,4 @@ triad_results.jsonl
 
 # 数据文件（车厂专有 PDF 等版权物不入库）
 data/
+output/

@@ -21,15 +21,16 @@ def get_trulens_session() -> TruSession:
     )
 
 
-class DashScopeLiteLLM(LiteLLM):
-    """DashScope 兼容的裁判 Provider。
+class OpenAICompatLiteLLM(LiteLLM):
+    """OpenAI 兼容端点的裁判 Provider（默认 DeepSeek）。
 
-    ★ DashScope 的 OpenAI 兼容端点要求：response_format 用 json_object/json_schema 时，
-    messages 里必须出现字面量 "json"，否则 400（InvalidParameter）。
+    ★ 兼容性注入：部分 OpenAI 兼容端点（如 DashScope）要求 response_format 用
+    json_object/json_schema 时，messages 里必须出现字面量 "json"，否则 400。
     TruLens 裁判（relevance_with_cot_reasons 等）走 Pydantic 结构化输出，
     litellm 对不支持 json_schema 的端点降级为 json_object，而其内置 prompt
     不带 "json" 字样 → 每次裁判调用必挂。
-    这里在发送前给 prompt/messages 补上 JSON 字样，结构化输出照常生效。"""
+    这里在发送前给 prompt/messages 补上 JSON 字样；对原生支持 JSON 模式的
+    DeepSeek 无害（只是提示词里多一句话）。"""
 
     _JSON_HINT = "\n请以 JSON 格式输出结果。"
 
@@ -55,11 +56,11 @@ class DashScopeLiteLLM(LiteLLM):
 
 
 def get_llm_provider() -> LiteLLM:
-    """评估用 LLM Provider（LLM-as-Judge）。前缀 openai/ 走 OpenAI 兼容协议。"""
-    return DashScopeLiteLLM(
-        model_engine=f"openai/{settings.CHAT_MODEL}",
+    """评估用 LLM Provider（LLM-as-Judge）。前缀 openai/ 走 OpenAI 兼容协议（默认 DeepSeek）。"""
+    return OpenAICompatLiteLLM(
+        model_engine=f"openai/{settings.JUDGE_MODEL or settings.CHAT_MODEL}",
         completion_kwargs={
-            "api_key": settings.DASHSCOPE_API_KEY,
+            "api_key": settings.chat_api_key,
             "api_base": settings.BASE_URL_CHAT,
         },
     )

@@ -380,7 +380,11 @@ async def multi_channel_search(
         hal_result = {"is_grounded": True, "unsupported_claims": []}
     if not hal_result["is_grounded"]:
         claims = "、".join(hal_result.get("unsupported_claims", []))
-        answer += f"\n\n⚠️ 提示：以下内容未在手册中完全印证：{claims}"
+        warning = f"⚠️ 提示：以下内容未在手册中完全印证：{claims}"
+        answer += f"\n\n{warning}"
+        # ★ SSE 的 done 事件已带答案发出，警告以独立事件补发给流式客户端
+        #   （非流式调用方拿 return 的 answer，天然含警告）
+        _emit(event_sink, {"type": "warning", "content": warning})
 
     return {
         "answer": answer,

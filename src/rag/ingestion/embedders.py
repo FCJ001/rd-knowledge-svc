@@ -4,11 +4,18 @@
 # ★ Sparse 向量由 Milvus 2.6 内置 BM25 Function 自动生成
 # ============================================================
 
+from __future__ import annotations
+
+import asyncio
+
 from langchain_community.embeddings import DashScopeEmbeddings
 
 from src.core.config import get_settings
 
 settings = get_settings()
+
+# embedding 并发上限：批量入库时多 worker 并发受限，防平台限流
+_EMBED_SEM = asyncio.Semaphore(max(1, settings.EMBED_CONCURRENCY))
 
 
 class DenseEmbedder:
@@ -28,4 +35,5 @@ class DenseEmbedder:
         if not texts:
             return []
         truncated = [t[:6000] if len(t) > 6000 else t for t in texts]
-        return await self.model.aembed_documents(truncated)
+        async with _EMBED_SEM:
+            return await self.model.aembed_documents(truncated)

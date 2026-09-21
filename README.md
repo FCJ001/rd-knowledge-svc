@@ -36,9 +36,10 @@ ruff check src scripts tests                   # lint
 
 | 项 | 说明 |
 |---|---|
-| `APP_ENV=prod` | 启动时强制校验：禁 debug、CORS 必须收敛、JWT 密钥必须配置 |
-| `AUTH_MODE=jwt` | 配 `JWT_SECRET`（HS256）或 `JWT_PUBLIC_KEY`（RS256）。若走网关 header 透传，网关必须剥离外部 `X-User-*` 头 |
-| 轮换密钥 | 历史 HS256 密钥与 DashScope/DeepSeek key 曾入库/明文落盘，必须轮换 |
+| `APP_ENV=prod` | 启动时强制校验：禁 debug、CORS 必须收敛、JWT 密钥必须配置、禁开发默认密码（DB/Neo4j/MinIO）、`MINERU_API_URL` 必须显式提供 |
+| `AUTH_MODE=jwt` | 配 `JWT_SECRET`（HS256）或 `JWT_PUBLIC_KEY`（RS256）。若走网关 header 透传，网关必须剥离外部 `X-User-*` 头并显式设 `GATEWAY_TRUSTED=true` |
+| 轮换密钥 | 历史 HS256 密钥与 DashScope/DeepSeek key 曾入库/明文落盘，必须轮换；已泄露密钥进 `JWT_REVOKED_SECRETS` 黑名单（部署侧注入） |
+| 数据备份 | `./scripts/backup.sh`：PG 在线逻辑备份 + MinIO 对象镜像；Neo4j/Milvus 数据卷需 `COLD_BACKUP=1` 停机冷备，配 crontab 定时执行 |
 | `CORS_ORIGINS` | 显式 origin 列表，禁止 `*` |
 | `MINIO_PUBLIC_READ=false` | 生产关闭桶公共读，改预签名 URL |
 | `/health` vs `/ready` | liveness 用 `/health`；readiness 用 `/ready`（探测 PG/Redis/Milvus/Neo4j） |

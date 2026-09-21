@@ -25,6 +25,7 @@ from src.infra.milvus_client import escape_milvus_string
 from src.infra.minio_client import ensure_bucket_exists, upload_file
 from src.rag.config import ChunkingConfig
 from src.rag.ingestion.chunkers import get_chunker, merge_short_chunks
+from src.rag.ingestion.image_summarizer import summarize_table
 from src.rag.ingestion.parsers import DocumentParser
 
 if TYPE_CHECKING:
@@ -51,6 +52,49 @@ def _normalize_table_html(html: str) -> str:
 def _normalize_formula(text: str) -> str:
     """去所有空白，用于 content_list equation.text 与 md $$..$$ token 的匹配"""
     return re.sub(r"[\s\u00a0]+", "", text or "")
+
+
+def _format_vl_note(summary: str, vl_md: str) -> str:
+    """VL 表格增强结果格式化为引用块：摘要（可检索文本）+ 校读 Markdown 表格。
+    两者都可能为空（fail-open 下单侧缺失）。"""
+    lines: list[str] = []
+    if summary:
+        lines.append(f"> 表格摘要：{summary}")
+    if vl_md:
+        if lines:
+            lines.append(">")
+        lines.append("> VL 校读：")
+        lines.extend(f"> {ln}".rstrip() for ln in vl_md.strip().splitlines())
+    return "\n".join(lines)
+
+
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _extract_numbers(text: str) -> set[float]:
+    """提取文本中的数值集合（去千分位逗号、剥 HTML 标签、归一化 1.50==1.5）"""
+    text = re.sub(r"(?<=\d),(?=\d)", "", text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    return {round(float(m), 4) for m in _NUM_RE.findall(text)}
+
+
+def _table_numbers_mismatch(html: str, vl_md: str) -> tuple[set[float], set[float]] | None:
+    """双通道数值互查：比较 MinerU HTML 与 VL 校读的数值集合。
+
+    返回 (仅 HTML 有, 仅 VL 有)；任一侧为空或无数值时不可比，返回 None。
+    判定策略：只有当两侧各自都存在对方没有的数值时才算实质分歧——
+    单侧多出的条款号/行号（VL 常省略）不算错误。"""
+    if not vl_md or not html:
+        return None
+    html_nums = _extract_numbers(html)
+    vl_nums = _extract_numbers(vl_md)
+    if not html_nums or not vl_nums:
+        return None
+    return html_nums - vl_nums, vl_nums - html_nums
+
+
+def _fmt_nums(nums: set[float], limit: int = 6) -> str:
+    return ", ".join(f"{x:g}" for x in sorted(nums)[:limit])
 
 
 def _locate_formula_rect(page, bbox: pymupdf.Rect, md_before: str) -> pymupdf.Rect | None:
@@ -514,6 +558,7 @@ class IngestionPipeline:
             return md_text
 
         md_tables = list(TABLE_HTML_RE.finditer(md_text))
+        vl_enabled = settings.TABLE_VL_ENABLED
 
         # 1) 按文档顺序排所有表格块，逐块匹配
         ordered = sorted(
@@ -524,6 +569,7 @@ class IngestionPipeline:
             ),
         )
         table_images: dict[int, list[str]] = {}  # md table 索引 -> 图片引用
+        vl_notes: dict[int, list[str]] = {}      # md table 索引 -> VL 摘要+校读引用块
         appendix: list[str] = []
         t_idx = 0
         last_matched: int | None = None
@@ -532,8 +578,9 @@ class IngestionPipeline:
             bbox = block.get("bbox")
             if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
                 continue
+            capture: dict = {} if vl_enabled else None
             img_ref = await self._render_block_original(
-                block, file_path, doc_id, doc_name, kind="table",
+                block, file_path, doc_id, doc_name, kind="table", capture=capture,
             )
             if not img_ref:
                 continue
@@ -550,6 +597,28 @@ class IngestionPipeline:
                 if t_idx < len(md_tables):
                     last_matched = t_idx
                     table_images.setdefault(t_idx, []).append(img_ref)
+                    # ★ 表格 VL 增强：对主块原图做语义摘要 + Markdown 校读（fail-open）
+                    if vl_enabled and capture.get("png"):
+                        try:
+                            summary, vl_md = await summarize_table(capture["png"], "image/png")
+                            note = _format_vl_note(summary, vl_md)
+                            if note:
+                                # ★ 数值互查：两份独立转写的数字集合交叉比对
+                                diff = _table_numbers_mismatch(body, vl_md)
+                                if diff and diff[0] and diff[1]:
+                                    note += (
+                                        "\n> ⚠️ 双通道转写数值不一致，以原图为准"
+                                        f"（HTML 有：{_fmt_nums(diff[0])}；"
+                                        f"校读有：{_fmt_nums(diff[1])}）"
+                                    )
+                                    logger.warning(
+                                        f"表格双通道转写数值不一致 {doc_name} "
+                                        f"page={block.get('page_idx')}: "
+                                        f"HTML有[{_fmt_nums(diff[0])}] 校读有[{_fmt_nums(diff[1])}]"
+                                    )
+                                vl_notes.setdefault(t_idx, []).append(note)
+                        except Exception as e:
+                            logger.warning(f"表格 VL 增强失败（fail-open）: {e}")
                     t_idx += 1
                 else:
                     last_matched = None
@@ -564,13 +633,15 @@ class IngestionPipeline:
         if not table_images and not appendix:
             return md_text
 
-        # 2) 在 </table> 后插入对应图片引用
+        # 2) 在 </table> 后插入对应图片引用与 VL 增强块
         out: list[str] = []
         pos = 0
         for i, m in enumerate(md_tables):
             out.append(md_text[pos:m.end()])
             for ref in table_images.get(i, []):
                 out.append(f"\n\n{ref}\n")
+            for note in vl_notes.get(i, []):
+                out.append(f"\n\n{note}\n")
             pos = m.end()
         out.append(md_text[pos:])
         md_text = "".join(out)
@@ -580,12 +651,15 @@ class IngestionPipeline:
             md_text += "\n\n## 表格原图（识别对照）\n" + "\n\n".join(appendix)
             logger.info(f"表格原图 {len(appendix)} 张无法定位，转文末附录: {doc_name}")
 
-        logger.info(f"表格原图嵌入完成 {sum(len(v) for v in table_images.values())} 张: {doc_name}")
+        logger.info(
+            f"表格原图嵌入完成 {sum(len(v) for v in table_images.values())} 张，"
+            f"VL 校读 {sum(len(v) for v in vl_notes.values())} 张: {doc_name}"
+        )
         return md_text
 
     async def _render_block_original(
         self, block: dict, file_path: str, doc_id: str, doc_name: str,
-        kind: str = "table", md_before: str = "",
+        kind: str = "table", md_before: str = "", capture: dict | None = None,
     ) -> str | None:
         """渲染 page_idx 页面，按归一化 bbox 裁剪表格/公式区域 → 上传 MinIO → 返回引用。
 
@@ -596,6 +670,7 @@ class IngestionPipeline:
         kind=formula（公式原图）：MinerU equation bbox 整体偏高 ~90-110pt 且高度不可靠，
             优先用 _locate_formula_rect（公式前文本锚点 + 渲染密度扫描）定位真实区域，
             md_before 传公式前 markdown；定位失败退回 bbox 上下留白裁剪。
+        capture：传 dict 时把裁剪出的 png 字节带出（表格 VL 校读复用同一张图，不重复渲染）。
         fail-open：pymupdf 缺失/裁剪异常返回 None，不阻塞入库。"""
         import pymupdf  # 延迟导入，pymupdf 缺失时跳过原图
 
@@ -646,6 +721,8 @@ class IngestionPipeline:
                 matrix=pymupdf.Matrix(scale, scale), clip=padded, alpha=False,
             )
             png_bytes = pix.tobytes("png")
+            if capture is not None:
+                capture["png"] = png_bytes
 
             object_name = (
                 f"images/{doc_id}/{kind}/"

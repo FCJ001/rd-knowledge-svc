@@ -53,6 +53,8 @@ def _block(page_idx, bbox, body=None):
 def pipeline(monkeypatch):
     monkeypatch.setattr(pipe_mod, "upload_file", lambda *a, **k: None)
     monkeypatch.setattr(pipe_mod, "ensure_bucket_exists", lambda: None)
+    # 本文件只测对齐与嵌入逻辑：关闭表格 VL 增强，避免单测触达真实 VL API
+    monkeypatch.setattr(pipe_mod.settings, "TABLE_VL_ENABLED", False)
     # 绕过 __init__（会连 Milvus 建 collection），表格原图逻辑不使用实例状态
     return object.__new__(pipe_mod.IngestionPipeline)
 

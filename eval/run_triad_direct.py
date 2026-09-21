@@ -4,7 +4,7 @@
 # 背景：trulens 2.14 的 compute_feedbacks / OTEL 入库存在竞态，
 # 后台评估器在多通道长跑下产物不可靠（偶发 KeyError、NaN、
 # interpreter shutdown 杀线程）。本脚本绕开存储链路，用同一个
-# 裁判 Provider（DashScopeLiteLLM，含 JSON 兼容修复）同步计算
+# 裁判 Provider（OpenAICompatLiteLLM，含 JSON 兼容修复）同步计算
 # 三指标并就地汇总 —— 指标口径与 TruLens RAG Triad 完全一致。
 #
 # 用法：
@@ -39,11 +39,16 @@ CHANNELS = ["doc_rag", "graph_rag", "fusion"]
 TRIAD_RESULTS_PATH = Path(__file__).resolve().parent / "triad_results.jsonl"
 
 
+def _append_result(record: dict) -> None:
+    """同步落盘（async 侧经 to_thread 调用，避免阻塞事件循环）。"""
+    with open(TRIAD_RESULTS_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def build_tracked_rag(channel: str):
     """与 scripts/run_rag_experiments.py 的同名函数保持一致。"""
     from langchain_community.embeddings import DashScopeEmbeddings
     from langchain_openai import ChatOpenAI
-
     from src.core.config import get_settings
     from src.infra.milvus_client import get_milvus_client
     from src.infra.neo4j_client import get_neo4j_driver
@@ -52,7 +57,7 @@ def build_tracked_rag(channel: str):
     settings = get_settings()
     llm = ChatOpenAI(
         model=settings.CHAT_MODEL,
-        api_key=settings.DASHSCOPE_API_KEY,
+        api_key=settings.chat_api_key,
         base_url=settings.BASE_URL_CHAT,
         temperature=0,
     )
@@ -114,7 +119,9 @@ async def eval_channel(channel: str, questions: list[str]) -> dict:
         gnd = await _judge(provider.groundedness_measure_with_cot_reasons,
                            ctx_text, answer, key="有据性", scores=scores)
 
-        fmt = lambda x: f"{x:.2f}" if x is not None else "×"
+        def fmt(x):
+            return f"{x:.2f}" if x is not None else "×"
+
         print(f"  [{i}/{len(questions)}] 答案{fmt(a_rel)} 上下文{fmt(c_rel)} "
               f"有据{fmt(gnd)}  | {q[:34]}...", flush=True)
 
@@ -177,8 +184,7 @@ async def eval_channel(channel: str, questions: list[str]) -> dict:
         "per_question": per_question,
     }
     try:
-        with open(TRIAD_RESULTS_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        await asyncio.to_thread(_append_result, record)
         print(f"  结果已追加到 {TRIAD_RESULTS_PATH.name}")
     except Exception as e:
         print(f"  !! 落盘失败（不影响评测）: {e}")
@@ -196,7 +202,10 @@ async def main(channel: str | None):
             print(f"\n!! 通道 {ch} 失败（继续下一通道）: {type(e).__name__}: {str(e)[:150]}")
 
     print("\n══════════ 总表（RAG Triad 均值）══════════")
-    fmt = lambda x: f"{x:.3f}" if x is not None else "n/a"
+
+    def fmt(x):
+        return f"{x:.3f}" if x is not None else "n/a"
+
     print(f"{'通道':10s} {'答案相关性':>10s} {'上下文相关性':>12s} {'有据性':>8s}")
     for ch, r in all_results.items():
         print(f"{ch:10s} {fmt(r.get('答案相关性')):>10s} "

@@ -26,7 +26,7 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Lint (ruff)
-        run: ruff check src scripts tests
+        run: ruff check src scripts tests eval
 
       - name: Tests (pytest)
         run: pytest -q

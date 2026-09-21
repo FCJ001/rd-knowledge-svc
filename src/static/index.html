@@ -759,6 +759,10 @@ async function doSearchStream() {
             answerEl.innerHTML = renderMarkdown(answerText);
             katexRender(answerEl);  // 流式结束后统一渲染公式/表格
             imageUrls = payload.image_urls || [];
+          } else if (payload.type === 'warning') {
+            // 幻觉检测警告：追加到答案尾部展示（与后端非流式口径一致）
+            answerText += (answerText ? '\n\n' : '') + (payload.content || '');
+            answerEl.innerHTML = renderMarkdown(answerText);
           } else if (payload.type === 'error') {
             answerEl.innerHTML = `<div class="empty-state">⚠️ ${escHtml(payload.content||'未知错误')}</div>`;
           }

@@ -116,8 +116,8 @@ class AsyncEvaluator:
 
         if self.enabled:
             self._llm = ChatOpenAI(
-                model=settings.CHAT_MODEL,
-                api_key=settings.DASHSCOPE_API_KEY,
+                model=settings.JUDGE_MODEL or settings.CHAT_MODEL,
+                api_key=settings.chat_api_key,
                 base_url=settings.BASE_URL_CHAT,
                 temperature=0,
                 request_timeout=settings.LLM_REQUEST_TIMEOUT,

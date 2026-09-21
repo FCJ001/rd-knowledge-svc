@@ -85,7 +85,7 @@ def build_tracked_rag(channel: str, use_hyde: bool | None = None,
     settings = get_settings()
     llm = ChatOpenAI(
         model=settings.CHAT_MODEL,
-        api_key=settings.DASHSCOPE_API_KEY,
+        api_key=settings.chat_api_key,
         base_url=settings.BASE_URL_CHAT,
         temperature=0,
     )

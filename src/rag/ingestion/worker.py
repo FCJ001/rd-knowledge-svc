@@ -35,8 +35,9 @@ from src.infra.minio_client import download_file
 
 settings = get_settings()
 
-# 消息空闲多久才算"上一个 worker 挂了遗留的"（必须大于单条消息最长处理时间）
-PEL_MIN_IDLE_MS = 10 * 60 * 1000
+# 消息空闲多久才算"上一个 worker 挂了遗留的"（必须大于单条消息最长处理时间，
+# 否则并发/多 worker 场景会把正在处理中的大文档消息抢走造成重复处理）
+PEL_MIN_IDLE_MS = settings.INGEST_PEL_MIN_IDLE_S * 1000
 # PEL 回收巡检周期
 PEL_RECLAIM_INTERVAL_S = 60
 # XREADGROUP 阻塞时长（必须小于 REDIS_SOCKET_TIMEOUT，否则每次读都超时）
@@ -206,6 +207,7 @@ async def run_forever() -> None:
     consumer = f"{socket.gethostname()}-{os.getpid()}"
     logger.info(
         f"入库 worker 启动: group={settings.INGEST_CONSUMER_GROUP} consumer={consumer} "
+        f"concurrency={settings.INGEST_CONCURRENCY} "
         f"pel_reclaim={PEL_RECLAIM_INTERVAL_S}s/{PEL_MIN_IDLE_MS}ms"
     )
 
@@ -219,6 +221,19 @@ async def run_forever() -> None:
 
     last_reclaim = 0.0
 
+    # 并发消费：信号量限实际并发，任务数有背压上限；
+    # 消息读入即进 PEL，任务完成时各自 XACK，崩溃后由 PEL 回收兜底
+    concurrency = max(1, settings.INGEST_CONCURRENCY)
+    sem = asyncio.Semaphore(concurrency)
+    in_flight: set[asyncio.Task] = set()
+
+    async def _guarded(msg_id: str, fields: dict) -> None:
+        async with sem:
+            try:
+                await process_one(client, msg_id, fields)
+            except Exception:
+                logger.exception("处理入库消息时发生未捕获异常")
+
     while not stop.is_set():
         # 周期性队列指标 + PEL 回收
         now = time.monotonic()
@@ -227,12 +242,22 @@ async def run_forever() -> None:
             await _update_queue_metrics(client)
             await _reclaim_stale_messages(client, consumer)
 
+        # 背压：在途任务满时先等一个完成，避免消息被读进 PEL 却排队干等
+        while len(in_flight) >= concurrency * 2 and not stop.is_set():
+            done, _ = await asyncio.wait(
+                in_flight, timeout=READ_BLOCK_MS / 1000,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            in_flight -= done
+        if stop.is_set():
+            break
+
         try:
             resp = await client.xreadgroup(
                 settings.INGEST_CONSUMER_GROUP,
                 consumer,
                 {settings.INGEST_STREAM: ">"},
-                count=10,
+                count=concurrency,
                 block=READ_BLOCK_MS,
             )
         except asyncio.CancelledError:
@@ -251,11 +276,14 @@ async def run_forever() -> None:
                     # 优雅停机：不 XACK 未处理的消息，留给下个 worker（走 PEL 回收）
                     logger.info(f"停机中，消息 {msg_id} 留给后续 worker 处理")
                     break
-                try:
-                    await process_one(client, msg_id, fields)
-                except Exception:
-                    logger.exception("处理入库消息时发生未捕获异常")
-                    await asyncio.sleep(1)
+                task = asyncio.create_task(_guarded(msg_id, fields))
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
+
+    # 优雅停机：等在途任务收尾（完成时各自 XACK）
+    if in_flight:
+        logger.info(f"等待 {len(in_flight)} 个在途入库任务收尾...")
+        await asyncio.gather(*in_flight, return_exceptions=True)
 
     logger.info("入库 worker 已退出")
 
