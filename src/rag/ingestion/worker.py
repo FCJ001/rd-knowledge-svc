@@ -8,8 +8,11 @@
 #   → 更新 doc_ingest_jobs 进度 → XACK
 #
 # ★ 重试：处理失败按 INGEST_MAX_RETRIES 次退避重试，仍失败则标记 failed；
-# ★ 崩溃恢复：定期 XAUTOCLAIM 认领其他 consumer 遗留在 PEL 的消息
-#   （min-idle-time 防止把正在处理的消息抢走），文档不再卡死在 processing；
+# ★ 崩溃恢复：工人带存活心跳（Redis SET EX），定期认领「空闲超阈值 且
+#   原持有人心跳已失效」的 PEL 遗留消息——慢文档（心跳在续）不会被误抢，
+#   文档不再卡死在 processing；
+# ★ 对账兜底：queued 记录超过 INGEST_LOST_JOB_HOURS 仍无进展 → 标记 failed，
+#   把 maxlen 裁剪 / worker 长期不可用造成的静默丢任务变成显式失败；
 # ★ 优雅停机：SIGTERM/SIGINT 后停止取新消息，处理完在途消息再退出；
 # ★ 幂等：pipeline 先删后插，重复处理不会产生脏数据。
 # ============================================================
@@ -23,9 +26,11 @@ import signal
 import socket
 import tempfile
 import time
+from datetime import timedelta
 from pathlib import Path
 
 from loguru import logger
+from sqlalchemy import func, select
 
 from src.core.config import get_settings
 from src.core.logger import setup_logger
@@ -35,13 +40,17 @@ from src.infra.minio_client import download_file
 
 settings = get_settings()
 
-# 消息空闲多久才算"上一个 worker 挂了遗留的"（必须大于单条消息最长处理时间，
-# 否则并发/多 worker 场景会把正在处理中的大文档消息抢走造成重复处理）
+# 消息空闲多久才进入「疑似遗留」候选（与存活心跳配合判定，见 _claim_stale）。
+# ★ 心跳兜底后，本阈值不再承担「必须大于单条最长处理时间」的约束——
+#   它只决定「持有人死后多久才认领」，取值只影响恢复速度，不影响正确性。
 PEL_MIN_IDLE_MS = settings.INGEST_PEL_MIN_IDLE_S * 1000
-# PEL 回收巡检周期
+# PEL 回收 / 对账巡检周期
 PEL_RECLAIM_INTERVAL_S = 60
 # XREADGROUP 阻塞时长（必须小于 REDIS_SOCKET_TIMEOUT，否则每次读都超时）
 READ_BLOCK_MS = 3000
+# 工人存活心跳 TTL：主循环每轮刷新（轮次 ≤ READ_BLOCK_MS=3s），崩溃后
+# 最多 TTL 过期才被判定失联，遗留消息才会被其他 worker 认领
+ALIVE_TTL_S = 60
 
 
 def _client():
@@ -55,6 +64,18 @@ def _client():
 def _decode(field):
     """decode_responses 开关下字段可能是 bytes 或 str，统一解码"""
     return field.decode("utf-8") if isinstance(field, bytes) else field
+
+
+def _alive_key(owner: str) -> str:
+    return f"{settings.INGEST_STREAM}:alive:{owner}"
+
+
+async def _heartbeat(client, consumer: str) -> None:
+    """刷新本工人存活心跳。失败不抛：下轮循环会再刷，TTL 60s 余量充足。"""
+    try:
+        await client.set(_alive_key(consumer), "1", ex=ALIVE_TTL_S)
+    except Exception as e:
+        logger.warning(f"刷新存活心跳失败（下轮重试）: {e}")
 
 
 async def _mark_failed(job_id: str, error: str) -> None:
@@ -98,6 +119,7 @@ async def _do_ingest(payload: dict) -> str:
                     category=payload.get("category", ""),
                     business_line=payload.get("business_line", ""),
                     model_code=payload.get("model_code", ""),
+                    acl_roles=payload.get("acl_roles", ""),
                     chunk_strategy=payload.get("chunk_strategy", "fixed"),
                     parser=payload.get("parser", "mineru"),
                 )
@@ -164,35 +186,89 @@ async def _update_queue_metrics(client) -> None:
         logger.warning(f"更新队列指标失败: {e}")
 
 
-async def _reclaim_stale_messages(client, consumer: str) -> int:
-    """XAUTOCLAIM 认领其他 consumer 遗留在 PEL 的消息（崩溃恢复）。
+async def _claim_stale(client, consumer: str) -> list[tuple[str, dict]]:
+    """认领「原持有人已失联」的 PEL 遗留消息，返回列表交主循环并发派发。
 
-    只认领空闲超过 PEL_MIN_IDLE_MS 的消息，不会抢走正在处理中的任务。
-    返回认领条数。"""
-    reclaimed = 0
+    判据 = 空闲超过 PEL_MIN_IDLE_MS **且** 原 consumer 的存活心跳已过期。
+    ★ 心跳是承重的：单看空闲时长无法区分「持有人死了」和「一份大文档还在
+      正常处理」（并发/多 worker 下误抢 = 同一文档重复处理，白烧一遍解析）。
+      有了心跳就不再依赖「阈值必须大于单条最长处理时间」的人为约定。
+    用 XPENDING(idle 过滤) + 逐条 XCLAIM，而不是 XAUTOCLAIM 一把梭：
+    认领前能按 owner 跳过活人，XCLAIM 自带的 min_idle 二次校验防竞态。
+    """
+    claimed: list[tuple[str, dict]] = []
     try:
-        cursor = "0-0"
-        while True:
-            result = await client.xautoclaim(
-                settings.INGEST_STREAM,
-                settings.INGEST_CONSUMER_GROUP,
-                consumer,
-                min_idle_time=PEL_MIN_IDLE_MS,
-                start_id=cursor,
-                count=10,
-            )
-            # redis-py 返回 (next_cursor, messages, deleted_ids)
-            next_cursor, messages = result[0], result[1]
-            for msg_id, fields in messages:
-                logger.warning(f"认领遗留消息 msg_id={msg_id}（原 worker 已失联）")
-                await process_one(client, msg_id, fields)
-                reclaimed += 1
-            if next_cursor == "0-0" or not messages:
-                break
-            cursor = next_cursor
+        pending = await client.xpending_range(
+            settings.INGEST_STREAM,
+            settings.INGEST_CONSUMER_GROUP,
+            min="-",
+            max="+",
+            count=50,
+            idle=PEL_MIN_IDLE_MS,
+        )
+        for entry in pending:
+            owner = entry.get("consumer", "")
+            msg_id = entry.get("message_id")
+            if not msg_id:
+                continue
+            try:
+                if await client.exists(_alive_key(owner)):
+                    continue  # 原持有人还活着（可能正在处理大文档），不抢
+                msgs = await client.xclaim(
+                    settings.INGEST_STREAM,
+                    settings.INGEST_CONSUMER_GROUP,
+                    consumer,
+                    min_idle_time=PEL_MIN_IDLE_MS,
+                    message_ids=[msg_id],
+                )
+            except Exception as e:
+                logger.warning(f"认领消息 {msg_id} 失败（下个周期重试）: {e}")
+                continue
+            for m_id, fields in msgs:
+                logger.warning(f"认领遗留消息 msg_id={m_id}（原持有人 {owner} 心跳已失效）")
+                claimed.append((m_id, fields))
     except Exception as e:
         logger.warning(f"PEL 回收失败（下个周期重试）: {e}")
-    return reclaimed
+    return claimed
+
+
+async def _sweep_lost_jobs() -> int:
+    """对账兜底：queued 记录超过 INGEST_LOST_JOB_HOURS 仍无进展 → 标记 failed。
+
+    maxlen 裁剪会无声吞掉「已落库、从未投递」的任务，DB 记录永远停在
+    queued——对账是唯一能把它变成显式失败的机制。只扫 queued 不扫
+    processing：后者的活账由 PEL 回收兜底（有消息侧凭证），queued 没有
+    凭证只能按时间判死；阈值（默认 2h）远大于正常排队时长，误判面极小。
+    时间比较全部走服务端（func.now() - interval）：列是 naive DateTime，
+    避免 Python 侧时区语义与 DB 不一致。
+    """
+    cutoff_h = max(1, settings.INGEST_LOST_JOB_HOURS)
+    try:
+        from src.knowledge.model import DocIngestJob
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(DocIngestJob).where(
+                    DocIngestJob.stage == "queued",
+                    DocIngestJob.updated_at < func.now() - timedelta(hours=cutoff_h),
+                )
+            )
+            jobs = list(result.scalars().all())
+            if not jobs:
+                return 0
+            for job in jobs:
+                job.stage = "failed"
+                job.error_msg = (
+                    f"任务丢失：queued 超过 {cutoff_h}h 无进展"
+                    f"（队列积压被裁剪或 worker 长期不可用），请重新上传"
+                )
+            await db.commit()
+            for job in jobs:
+                logger.warning(f"对账标记丢失任务 job_id={job.id}（queued 超时）")
+            return len(jobs)
+    except Exception as e:
+        logger.warning(f"丢失任务对账失败（下个周期重试）: {e}")
+        return 0
 
 
 async def run_forever() -> None:
@@ -208,7 +284,8 @@ async def run_forever() -> None:
     logger.info(
         f"入库 worker 启动: group={settings.INGEST_CONSUMER_GROUP} consumer={consumer} "
         f"concurrency={settings.INGEST_CONCURRENCY} "
-        f"pel_reclaim={PEL_RECLAIM_INTERVAL_S}s/{PEL_MIN_IDLE_MS}ms"
+        f"pel_reclaim={PEL_RECLAIM_INTERVAL_S}s/{PEL_MIN_IDLE_MS}ms(且心跳失效) "
+        f"alive_ttl={ALIVE_TTL_S}s lost_sweep={settings.INGEST_LOST_JOB_HOURS}h"
     )
 
     stop = asyncio.Event()
@@ -235,12 +312,22 @@ async def run_forever() -> None:
                 logger.exception("处理入库消息时发生未捕获异常")
 
     while not stop.is_set():
-        # 周期性队列指标 + PEL 回收
+        # 每轮刷新存活心跳（轮次 ≤ 3s，TTL 60s 余量充足）
+        await _heartbeat(client, consumer)
+
+        # 周期性队列指标 + PEL 回收 + 丢失任务对账
         now = time.monotonic()
         if now - last_reclaim >= PEL_RECLAIM_INTERVAL_S:
             last_reclaim = now
             await _update_queue_metrics(client)
-            await _reclaim_stale_messages(client, consumer)
+            # 认领的遗留消息走与正常消费同一条 _guarded 派发路径：
+            # 同受信号量约束，且不阻塞主循环（旧实现串行内联，一次认领
+            # 多条时会把主循环饿住几分钟）
+            for msg_id, fields in await _claim_stale(client, consumer):
+                task = asyncio.create_task(_guarded(msg_id, fields))
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
+            await _sweep_lost_jobs()
 
         # 背压：在途任务满时先等一个完成，避免消息被读进 PEL 却排队干等
         while len(in_flight) >= concurrency * 2 and not stop.is_set():

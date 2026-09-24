@@ -87,6 +87,8 @@ class TokenTracker(BaseCallbackHandler):
             "total_tokens": self._input_tokens + self._output_tokens,
             "cost_usd": round(self.cost, 6),
             "calls": self._calls,
+            # model 用于成本归因（按模型打点 llm_cost_usd_total）
+            "model": self._model,
         }
 
     @property

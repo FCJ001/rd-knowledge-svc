@@ -65,12 +65,35 @@ RETRIEVAL_LATENCY = Histogram(
     buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, float("inf")),
 )
 
+RETRIEVAL_OUTCOME = Counter(
+    "knowledge_retrieval_outcome_total",
+    "检索最终结果分类：ok=有结果 / empty=检索成功但无内容 / degraded=全部通道故障",
+    ["outcome"],
+)
+# ★ empty 与 degraded 必须分开统计：前者是知识库覆盖问题（该补文档），
+#   后者是服务依赖故障（该查 Milvus/embedding）。混在一起会让
+#   "空答案率"告警分不清是内容缺口还是系统故障。
+
+# ── LLM 成本 ─────────────────────────────────────────────────
+
+LLM_COST_USD = Counter(
+    "llm_cost_usd_total",
+    "LLM 调用成本估算（美元，按 Settings.MODEL_PRICING_* 折算）",
+    ["model"],
+)
+
 # ── 限流 ─────────────────────────────────────────────────────
 
 RATE_LIMIT_REJECTED = Counter(
     "rate_limit_rejected_total",
     "限流拒绝次数（按端点）",
     ["endpoint"],
+)
+
+QUOTA_REJECTED = Counter(
+    "token_quota_rejected_total",
+    "Token 配额拒绝次数（scope=user）",
+    ["scope"],
 )
 
 # ── 熔断器 ───────────────────────────────────────────────────

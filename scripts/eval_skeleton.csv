@@ -1,0 +1,5 @@
+﻿question,relevant_doc_ids,relevant_pages,answer_type,modality,expect_no_answer,note
+（示例·精确值）EV160 前轮毂轴承的紧固扭矩是多少？,<文档名>.pdf,<文档名>.pdf:p123; <文档名>.pdf:p124,exact_value,table,,格式示例，请替换为真实题目
+（示例·描述性）电池包绝缘电阻偏低可能由哪些原因导致？,<文档名>.pdf,<文档名>.pdf:p88,descriptive,text,,格式示例，请替换为真实题目
+（示例·跨章节）更换动力电池后需要同步校验哪些系统？,<文档名>.pdf;<另一文档>.pdf,,cross_section,text,,格式示例；跨文档题可只填 doc 级
+（示例·拒答题）我们的知识库里有没有 2030 款某车型的维修手册？,,,,,1,拒答题：库里确实没有答案，用于标定'该拒答'的分数阈值

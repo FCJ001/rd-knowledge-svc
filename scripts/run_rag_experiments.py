@@ -377,10 +377,17 @@ async def main(channel: str | None = None, dashboard: bool = False,
             "use_hyde": _s.RAG_HYDE_ENABLED if use_hyde is None else use_hyde,
             "top_k": _s.RAG_TOP_K if top_k is None else top_k,
             "rerank_top_k": _s.RAG_RERANK_TOP_K if rerank_top_k is None else rerank_top_k,
+            # ★ rerank_provider 必须记录：三臂对比（deepseek/dashscope/off）往往共用
+            #   同一个 label，不写进 params 就会被 _result_key/_compare_with_history
+            #   当成同一组配置，历史对比与归因全部失真。
+            "rerank_provider": _s.RERANK_PROVIDER,
+            "rerank_text_field": "parent_text",  # 精排输入口径（与生成用文本对齐）
+            "context_max_chars": _s.RAG_CONTEXT_MAX_CHARS,
             "label": label or "",
         }
         print(f"消融参数: use_hyde={ablation['use_hyde']} top_k={ablation['top_k']} "
-              f"rerank_top_k={ablation['rerank_top_k']}"
+              f"rerank_top_k={ablation['rerank_top_k']} "
+              f"rerank_provider={ablation['rerank_provider']}"
               + (f" label={ablation['label']}" if ablation["label"] else ""))
 
         summaries: dict = {}

@@ -34,3 +34,15 @@ async def test_keys_isolated():
     assert await limiter.allow("u1") is True
     assert await limiter.allow("u2") is True  # 不同 key 互不影响
     assert await limiter.allow("u1") is False
+
+
+async def test_incremental_cleanup_removes_empty_keys(monkeypatch):
+    """过期空 key 被增量清理移除（曾经的 _cleanup 是死代码，key 只增不减）。"""
+    limiter = SlidingWindowRateLimiter(max_requests=5, window_seconds=0.01)
+    for k in ("a", "b", "c"):
+        await limiter.allow(k)
+    await asyncio.sleep(0.02)  # 窗口滑过，a/b/c 全部过期
+    monkeypatch.setattr(type(limiter), "_OPS_PER_SWEEP", 2)  # 加快触发
+    await limiter.allow("fresh")  # 第 4 次判定 → 触发增量清理
+    assert all(k not in limiter._hits for k in ("a", "b", "c"))
+    assert "fresh" in limiter._hits

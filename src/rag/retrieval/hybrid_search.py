@@ -17,6 +17,7 @@ async def hybrid_search(
     collection_name: str,
     dense_embedding: list[float],
     query_text: str,
+    acl_expr: str | None,
     top_k: int = 20,
     filters: dict | None = None,
     extra_dense_queries: list[list[float]] | None = None,
@@ -26,8 +27,13 @@ async def hybrid_search(
     extra_dense_queries: 额外 dense 查询向量（如 HyDE 假设文档向量），
     每个向量独立成为一个 COSINE AnnSearchRequest，参与同一 RRF 融合，
     用于 doc 通道内部的多路并行召回（原始查询 / HyDE / BM25）。
+
+    acl_expr: 权限谓词（见 knowledge/acl.py），并进每个 AnnSearchRequest 的
+    布尔表达式。★ 无默认值：必须显式给出——None 的语义是"已确认本次查询
+    无需 ACL 约束"（admin 或 DOC_ACL_ENABLED=false），不是"忘了传"。
+    RRF 融合发生在过滤之后，所以无权内容既不占 top_k，也不会经融合进入结果。
     """
-    filter_expr = _build_filter(filters) if filters else ""
+    filter_expr = _and_expr(_build_filter(filters) if filters else "", acl_expr)
 
     dense_req = AnnSearchRequest(
         data=[dense_embedding],
@@ -88,4 +94,15 @@ def _build_filter(filters: dict) -> str:
             parts.append(f'{key} in [{values_str}]')
         else:
             parts.append(f'{key} == "{escape_milvus_string(value)}"')
+    return " and ".join(parts)
+
+
+def _and_expr(*exprs: str | None) -> str:
+    """用 and 连接非空表达式，逐项加括号。
+
+    ★ 必须加括号：ACL 谓词本身是函数调用（array_contains_any(...)），
+    与 `a == "b" and c == "d"` 直接拼接时运算符优先级不可依赖——
+    少一层括号就可能让 ACL 谓词被 and 的另一项吃掉（过滤静默失效）。
+    """
+    parts = [f"({e})" for e in exprs if e]
     return " and ".join(parts)

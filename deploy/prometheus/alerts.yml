@@ -112,3 +112,116 @@ groups:
         annotations:
           summary: "LLM 输出 token 速率激增"
           description: "输出 token 速率 {{ $value }} /s，注意成本；可检查是否有异常重试或死循环。"
+
+      # 按模型折算的美元成本速率（需先由检索链路记账，见 core/quota.py add_tokens）
+      - alert: KnowledgeSvcCostRateHigh
+        expr: |
+          sum(rate(llm_cost_usd_total[1h])) * 3600 > 5
+        for: 15m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "LLM 成本速率偏高"
+          description: "预计每小时成本 {{ $value }} 美元。按 llm_cost_usd_total 的 model 维度定位是哪个链路在烧。"
+
+      # 配额拒绝激增 = 有人在触顶，也可能配额设得过紧误伤正常用户
+      - alert: KnowledgeSvcQuotaRejections
+        expr: |
+          sum(rate(token_quota_rejected_total[10m])) > 0.2
+        for: 10m
+        labels:
+          severity: info
+          service: rd-knowledge-svc
+        annotations:
+          summary: "Token 配额拒绝频繁"
+          description: "配额拒绝速率 {{ $value }} /s。确认是异常调用还是 USER_DAILY_TOKEN_QUOTA 偏低。"
+
+  # ── 结果质量 ───────────────────────────────────────────────
+  - name: rd-knowledge-svc-quality
+    rules:
+      # 「空答案率」：检索成功但无内容 = 知识库覆盖不足（该补文档）。
+      # 与 degraded（依赖故障）分开统计，否则分不清是内容缺口还是系统故障。
+      - alert: KnowledgeSvcHighEmptyRate
+        expr: |
+          sum(rate(knowledge_retrieval_outcome_total{outcome="empty"}[30m]))
+            / clamp_min(sum(rate(knowledge_retrieval_outcome_total[30m])), 1e-6)
+          > 0.3
+        for: 30m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "检索空答案率偏高"
+          description: "{{ $value | humanizePercentage }} 的请求检索成功但没有内容。可能是语料覆盖不足、过滤条件过严，或切分/召回退化。"
+
+      # 低置信拒答比例过高：要么阈值过严（误伤能答的问题），要么语料真的缺
+      # 这类内容。与 empty 分开看——empty 是"召回为空"，这个是"召回了但不够像"。
+      - alert: KnowledgeSvcHighRefusalRate
+        expr: |
+          sum(rate(knowledge_retrieval_outcome_total{outcome="low_confidence"}[30m]))
+            / clamp_min(sum(rate(knowledge_retrieval_outcome_total[30m])), 1e-6)
+          > 0.2
+        for: 30m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "低置信拒答比例偏高"
+          description: "{{ $value | humanizePercentage }} 的请求因置信度不足被拒答。检查 RAG_REFUSE_THRESHOLD 是否偏严（换过 reranker 需重新标定），或语料覆盖是否有缺口。"
+
+      # 全部通道故障：用户侧已按 503 应答，这里给出比 5xx 更明确的语义
+      - alert: KnowledgeSvcRetrievalUnavailable
+        expr: |
+          sum(rate(knowledge_retrieval_outcome_total{outcome="degraded"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: rd-knowledge-svc
+        annotations:
+          summary: "检索全面不可用（全部通道故障）"
+          description: "所有检索通道均失败，用户收到 503。立即检查 Milvus / embedding 上游 / Neo4j 可用性。"
+
+  # ── 入库队列积压 ───────────────────────────────────────────
+  - name: rd-knowledge-svc-queue
+    rules:
+      # 队列持续积压：消费者跟不上，或 worker 已挂
+      - alert: KnowledgeSvcIngestQueueBacklog
+        expr: |
+          max_over_time(ingest_queue_depth{kind="stream"}[15m]) > 200
+        for: 15m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "入库队列积压"
+          description: "队列深度 {{ $value }} 持续 15 分钟。检查 worker 存活、MinerU 是否变慢、是否需要扩容副本。"
+
+      # PEL 待确认消息堆积 = 消息已投递但未确认（worker 崩溃或卡死）
+      - alert: KnowledgeSvcIngestPelBacklog
+        expr: |
+          max_over_time(ingest_queue_depth{kind="pel"}[15m]) > 50
+        for: 15m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "入库 PEL 待确认消息堆积"
+          description: "PEL 深度 {{ $value }} 持续 15 分钟。可能有 worker 崩溃未被回收，检查心跳键与 PEL 回收日志。"
+
+  # ── 尾延迟 ─────────────────────────────────────────────────
+  - name: rd-knowledge-svc-tail-latency
+    rules:
+      # p99 单独告警：p95 达标不代表尾部健康（Milvus 实测 P99/P50 可达 2.04）
+      - alert: KnowledgeSvcTailLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{path=~".*knowledge.*"}[10m])) by (le)
+          ) > 15
+        for: 10m
+        labels:
+          severity: warning
+          service: rd-knowledge-svc
+        annotations:
+          summary: "知识检索 p99 延迟过高"
+          description: "p99 延迟 {{ $value }}s（持续 10 分钟）。尾延迟通常来自 Milvus 慢查询、LLM 排队或重试放大，用 retrieval_channel_duration_seconds 定位通道。"

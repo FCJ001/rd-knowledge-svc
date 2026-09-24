@@ -31,14 +31,21 @@ class SlidingWindowRateLimiter:
     保留为：算法参照 + 单进程/无 Redis 后端的回退实现。
     """
 
+    # 增量清理参数：每 N 次判定触发一次，单次最多扫 M 个 key——
+    # 分摊清理开销，避免请求路径出现周期性尖刺
+    _OPS_PER_SWEEP = 512
+    _SWEEP_KEY_CAP = 256
+
     def __init__(self, max_requests: int, window_seconds: float):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._lock = asyncio.Lock()
+        self._ops = 0
 
     async def allow(self, key: str) -> bool:
         """记录一次请求；窗口内未超限返回 True，否则返回 False。"""
+        await self._maybe_cleanup()
         now = time.monotonic()
         cutoff = now - self.window_seconds
         async with self._lock:
@@ -49,22 +56,35 @@ class SlidingWindowRateLimiter:
                 window.append(now)
                 return True
             return False
-        # 空 key 由周期清理移除（见 _cleanup），避免 user_id 基数下缓慢泄漏
 
-    async def _cleanup(self) -> int:
-        """移除窗口已空的 key，防止内存无界增长。定期（如每分钟）调用。"""
+    async def _maybe_cleanup(self) -> None:
+        """移除窗口已空的 key，防止 user_id 基数下内存缓慢泄漏。
+
+        增量而非全量：限流判定在请求关键路径上，全表扫描会周期性
+        卡住并发请求。顺序扫一段 key（list() 拷贝避免迭代中变更），
+        下次触发从哨兵位置继续，最终覆盖全表。
+        """
+        self._ops += 1
+        if self._ops % self._OPS_PER_SWEEP != 0:
+            return
         now = time.monotonic()
         cutoff = now - self.window_seconds
+        keys = list(self._hits.keys())
+        start = (self._ops // self._OPS_PER_SWEEP * self._SWEEP_KEY_CAP) % max(1, len(keys)) if keys else 0
         removed = 0
         async with self._lock:
-            for key in list(self._hits.keys()):
-                window = self._hits[key]
+            for i in range(min(self._SWEEP_KEY_CAP, len(keys))):
+                key = keys[(start + i) % len(keys)]
+                window = self._hits.get(key)
+                if window is None:
+                    continue
                 while window and window[0] <= cutoff:
                     window.popleft()
                 if not window:
-                    del self._hits[key]
+                    self._hits.pop(key, None)
                     removed += 1
-        return removed
+        if removed:
+            logger.debug(f"限流内存后端增量清理：移除 {removed} 个空 key")
 
 
 class RedisSlidingWindowRateLimiter:

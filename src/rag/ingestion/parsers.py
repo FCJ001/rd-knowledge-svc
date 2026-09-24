@@ -20,7 +20,7 @@ class DocumentParser:
     async def parse(
         self, file_path: str, formula_enable: bool = True,
         return_content_list: bool = False,
-    ) -> tuple[str, list[int], dict[str, bytes], list[dict], list[dict]]:
+    ) -> tuple[str, list[int], dict[str, bytes], list[dict], list[dict], list[tuple[int, str]]]:
         """
         Returns: (markdown_content, page_numbers_per_chunk, images_dict,
                   table_blocks, equation_blocks)
@@ -38,7 +38,7 @@ class DocumentParser:
 
         if self.parser == "mineru":
             try:
-                (md_text, pages, images, table_blocks, equation_blocks) = (
+                (md_text, pages, images, table_blocks, equation_blocks, page_anchors) = (
                     await parse_document(
                         file_path, file_name, formula_enable=formula_enable,
                         return_content_list=return_content_list,
@@ -50,7 +50,8 @@ class DocumentParser:
                         f"{len(images)} images, {len(table_blocks)} tables, "
                         f"{len(equation_blocks)} equations)"
                     )
-                    return md_text, pages, images, table_blocks, equation_blocks
+                    return (md_text, pages, images, table_blocks, equation_blocks,
+                            page_anchors)
             except Exception as e:
                 logger.warning(f"MinerU 解析失败，降级到 LlamaIndex: {e}")
 
@@ -59,7 +60,7 @@ class DocumentParser:
 
     async def _parse_with_llamaindex(
         self, file_path: str,
-    ) -> tuple[str, list[int], dict[str, bytes], list[dict], list[dict]]:
+    ) -> tuple[str, list[int], dict[str, bytes], list[dict], list[dict], list[tuple[int, str]]]:
         """LlamaIndex 兜底解析"""
         from llama_index.core import SimpleDirectoryReader
 
@@ -68,10 +69,10 @@ class DocumentParser:
             documents = reader.load_data()
         except Exception as e:
             logger.error(f"LlamaIndex 解析失败: {e}")
-            return "", [], [], [], []
+            return "", [], {}, [], [], []
 
         if not documents:
-            return "", [], [], [], []
+            return "", [], {}, [], [], []
 
         # 合并所有文档的文本
         full_text = "\n\n".join(doc.get_content() for doc in documents)
@@ -85,4 +86,11 @@ class DocumentParser:
             except (ValueError, TypeError):
                 pages.append(0)
 
-        return full_text, pages, {}, [], []
+        if not pages:
+            logger.warning(
+                f"LlamaIndex 兜底解析无页码信息: {Path(file_path).name}，"
+                "本批 chunk 的 page_number 将为 0"
+            )
+        # 兜底解析不产出 content_list，因此没有页码锚点（page_anchors 为空），
+        # 入库时 page_number 一律为 0 —— 引用将不显示页码。
+        return full_text, pages, {}, [], [], []

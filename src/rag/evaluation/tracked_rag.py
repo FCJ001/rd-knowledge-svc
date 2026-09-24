@@ -116,6 +116,7 @@ class TrackedRAG:
                 question=query,
                 embedding_model=self.embedding_model,
                 milvus_client=self.milvus_client,
+                role=self.role,
                 llm=self.llm,
                 use_hyde=self.use_hyde,
                 top_k=self.top_k,
@@ -142,6 +143,7 @@ class TrackedRAG:
                 question=query,
                 embedding_model=self.embedding_model,
                 milvus_client=self.milvus_client,
+                role=self.role,
                 llm=self.llm,
                 use_hyde=True,
             )
@@ -176,6 +178,7 @@ class TrackedRAG:
                 question=query,
                 embedding_model=self.embedding_model,
                 milvus_client=self.milvus_client,
+                role=self.role,
                 doc_type="spec_doc",
             )
             graph_task = search_graph_raw(query, self.neo4j_driver, self.llm)
@@ -219,6 +222,7 @@ class TrackedRAG:
             question=query,
             embedding_model=self.embedding_model,
             milvus_client=self.milvus_client,
+            role=self.role,
             top_k=self.top_k if top_k is None else top_k,
             rerank_top_k=self.rerank_top_k if rerank_top_k is None else rerank_top_k,
             **doc_kwargs,

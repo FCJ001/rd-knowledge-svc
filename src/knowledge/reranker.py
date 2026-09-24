@@ -1,7 +1,9 @@
 # ============================================================
 # 后检索精排（Rerank）
-# RERANK_PROVIDER=deepseek（默认）：DeepSeek LLM 清单式重排（DeepSeek 无专用 rerank 端点）
-# RERANK_PROVIDER=dashscope：qwen3-rerank 专用重排模型（保留的可选后端）
+# RERANK_PROVIDER=dashscope（默认）：qwen3-rerank 专用重排模型
+#   —— pointwise 分数确定性、可复现，拒答阈值可标定
+# RERANK_PROVIDER=deepseek：DeepSeek LLM 清单式重排（DeepSeek 无专用 rerank 端点，
+#   分数为 LLM 自评、有漂移；作为可选后端保留）
 # RERANK_PROVIDER=off：不做精排，直接用 RRF 融合序
 # 降级链：空→[] / len<=k→透传 / 超时或异常→docs[:k]（融合序）
 # ============================================================
@@ -25,8 +27,15 @@ RERANK_GAP_RATIO: float = 0.25  # 相对断崖阈值
 RERANK_GAP_ABS: float = 0.5     # 绝对断崖阈值
 
 # LLM 清单式重排：候选文本截断长度与候选数上限（控 prompt 体积与延迟）
-_LLM_RERANK_SNIPPET_CHARS: int = 600
+# ★ 重排必须看生成时真正会用的那段文本（parent_text），否则重排的排序依据
+#   与最终喂给 LLM 的上下文不是同一段，排出来的名次对不上答案质量。
+_LLM_RERANK_SNIPPET_CHARS: int = 800
 _LLM_RERANK_MAX_CANDIDATES: int = 20
+
+
+def _rerank_text(doc: dict) -> str:
+    """取参与重排的文本：优先父块（生成时用的就是它），回落子块。"""
+    return doc.get("parent_text") or doc.get("text", "")
 
 _LLM_RERANK_PROMPT = (
     "你是搜索结果重排器。给定用户查询和候选段落列表（每段以 [编号] 开头），"
@@ -97,8 +106,16 @@ async def _rerank_llm(
     use_dynamic_topk: bool,
 ) -> list[dict]:
     """DeepSeek LLM 清单式重排：一次调用对全部候选给出相关性分数并排序。"""
-    texts = [doc.get("text", "")[:_LLM_RERANK_SNIPPET_CHARS] for doc in documents]
-    shown = texts[:_LLM_RERANK_MAX_CANDIDATES]
+    texts = [_rerank_text(doc)[:_LLM_RERANK_SNIPPET_CHARS] for doc in documents]
+    # ★ 上限取自配置：若它小于候选总数，超出部分的候选 LLM 从未见过，
+    #   打出的分数与"见过但判为无关"无法区分，会被 0 分排在末尾。
+    cap = min(settings.RERANK_MAX_CANDIDATES, _LLM_RERANK_MAX_CANDIDATES * 5)
+    shown = texts[:cap]
+    if len(documents) > len(shown):
+        logger.warning(
+            f"重排候选被截断: 共 {len(documents)} 条，LLM 只见到前 {len(shown)} 条；"
+            f"请把 RERANK_MAX_CANDIDATES 提到 ≥ RAG_TOP_K"
+        )
     prompt = _LLM_RERANK_PROMPT.format(
         query=query,
         candidates="\n".join(f"[{i}] {t}" for i, t in enumerate(shown)),
@@ -128,7 +145,12 @@ async def _rerank_llm(
 
     # 分数断崖动态截断只在候选全部被 LLM 打分时启用（缺分候选的 0.0 会制造假断崖）
     if use_dynamic_topk and len(parsed) == len(documents):
-        keep = _cliff_topk([d["rerank_score"] for d in reranked])
+        keep = _cliff_topk(
+            [d["rerank_score"] for d in reranked],
+            min_topk=settings.RERANK_MIN_TOPK,
+            gap_abs=settings.RERANK_GAP_ABS,
+            gap_ratio=settings.RERANK_GAP_RATIO,
+        )
         logger.info(f"Rerank(LLM) 动态TopK: 截断至 {keep} 条 (候选 {len(reranked)} 条)")
         return reranked[:keep]
 
@@ -147,7 +169,7 @@ async def _rerank_dashscope(
     from dashscope import TextReRank
 
     dashscope.api_key = settings.DASHSCOPE_API_KEY
-    texts = [doc.get("text", "") for doc in documents]
+    texts = [_rerank_text(doc) for doc in documents]
 
     # ★ dashscope 是同步 HTTP 客户端：to_thread 下放 + 整体超时，
     #   否则一次精排挂起就冻结事件循环数秒~数十秒
@@ -177,7 +199,12 @@ async def _rerank_dashscope(
     reranked.sort(key=lambda d: d["rerank_score"], reverse=True)
 
     if use_dynamic_topk:
-        keep = _cliff_topk([d["rerank_score"] for d in reranked])
+        keep = _cliff_topk(
+            [d["rerank_score"] for d in reranked],
+            min_topk=settings.RERANK_MIN_TOPK,
+            gap_abs=settings.RERANK_GAP_ABS,
+            gap_ratio=settings.RERANK_GAP_RATIO,
+        )
         logger.info(f"Rerank 动态TopK: 截断至 {keep} 条 (候选 {len(reranked)} 条)")
         return reranked[:keep]
 

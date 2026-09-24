@@ -13,17 +13,18 @@ import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.base_schema import ResponseSchema
 from src.core.config import get_settings
-from src.core.deps import UserContext, get_current_user
+from src.core.deps import UserContext, get_current_user, roles_from_csv
 from src.core.logger import logger
 from src.core.metrics import INGESTION_JOBS
 from src.core.rate_limit import check_rate_limit
 from src.infra.db import get_db
+from src.knowledge.acl import AclConfigError, effective_acl_roles
 from src.knowledge.doc_ingestion import (
     create_ingest_record,
 )
@@ -45,12 +46,35 @@ def _sanitize_filename(name: str) -> str:
     return cleaned or "unnamed"
 
 
+async def _require_doc_delete_role(
+    user: UserContext = Depends(get_current_user),
+) -> UserContext:
+    """删除文档的角色校验：白名单取自 DOC_DELETE_REQUIRED_ROLES。
+
+    与 deps.require_role 的区别：这里允许配置为空（开发环境不校验），
+    而 require_role 收到空白名单会直接报错——删除是不可逆操作，
+    「配置成空」必须是调用方显式选择，不能是偶然结果。
+    """
+    allowed = roles_from_csv(get_settings().DOC_DELETE_REQUIRED_ROLES)
+    if not allowed:
+        logger.warning("DOC_DELETE_REQUIRED_ROLES 为空：删除文档未做角色校验（仅限开发环境）")
+        return user
+    if user.role not in allowed:
+        logger.warning(
+            f"删除文档被拒: user={user.user_id} role={user.role} 需要 {allowed}"
+        )
+        raise HTTPException(status_code=403, detail="权限不足，需要管理员角色")
+    return user
+
+
+
 # ── Request / Response models ────────────────────────────────────────────
 
 class IngestResponse(BaseModel):
     doc_id: str
     doc_name: str
     status: str
+    acl_roles: list[str] = Field(default=[], description="生效的可见角色（空=仅 admin 可见）")
 
 
 class JobStatusResponse(BaseModel):
@@ -70,16 +94,30 @@ async def upload_doc(
     category: str = "",
     business_line: str = "",
     model_code: str = "",
+    acl_roles: str | None = None,
     chunk_strategy: str = "fixed",
     parser: str = "mineru",
     rate_limit: None = Depends(check_rate_limit),
     user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """上传文档并投递异步入库任务（worker 进程处理解析/切片/嵌入/索引）"""
+    """上传文档并投递异步入库任务（worker 进程处理解析/切片/嵌入/索引）
+
+    acl_roles：可见角色（逗号分隔，如 `engineer,business`）。不传 = 配置默认值
+    （DOC_ACL_DEFAULT_ROLES，默认仅 admin）；传空串 = 显式仅 admin。
+    检索侧据此在 Milvus 查询里做检索前过滤，无权内容不进候选集。
+    """
     settings = get_settings()
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名为空")
+
+    # ★ ACL 解析放最前：角色拼错（如 enginer）宁可 400，也不要落一份
+    #   "除 admin 谁都看不见"的静默文档（用户侧表现为检索不到，无法归因）
+    try:
+        effective_roles = effective_acl_roles(acl_roles)
+    except AclConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    acl_roles_str = ",".join(effective_roles)
 
     # ★ 扩展名白名单：入库只吃文档类文件
     raw_name = Path(file.filename).name
@@ -122,6 +160,7 @@ async def upload_doc(
             category=category,
             business_line=business_line,
             model_code=model_code,
+            acl_roles=acl_roles_str,
             chunk_strategy=chunk_strategy,
             parser=parser,
         )
@@ -142,6 +181,7 @@ async def upload_doc(
             "category": category,
             "business_line": business_line,
             "model_code": model_code,
+            "acl_roles": acl_roles_str,
             "chunk_strategy": chunk_strategy,
             "parser": parser,
             "trace_id": trace_id_var.get(),
@@ -158,10 +198,14 @@ async def upload_doc(
 
         await db.commit()
         INGESTION_JOBS.labels(status="queued").inc()
+        logger.info(
+            f"文档上传受理: {doc_name} doc_id={doc_id} acl_roles={effective_roles or '（仅 admin）'}"
+        )
         return ResponseSchema(data=IngestResponse(
             doc_id=doc_id,
             doc_name=doc_name,
             status="queued",
+            acl_roles=effective_roles,
         ))
 
     except HTTPException:
@@ -181,12 +225,16 @@ async def upload_doc(
 @router.delete("/docs/{doc_id}", response_model=ResponseSchema[dict])
 async def remove_doc(
     doc_id: str,
-    user: UserContext = Depends(get_current_user),
+    user: UserContext = Depends(_require_doc_delete_role),
     db: AsyncSession = Depends(get_db),
 ):
-    """删除文档（Milvus + MinIO + PG 元数据 + 查询缓存）"""
+    """删除文档（Milvus + MinIO + PG 元数据 + 查询缓存）
+
+    不可逆操作（MinIO 原文一并删除），按 DOC_DELETE_REQUIRED_ROLES 校验角色。
+    """
     if not _DOC_ID_RE.match(doc_id or ""):
         raise HTTPException(status_code=400, detail="非法 doc_id")
+    logger.info(f"删除文档: doc_id={doc_id} by user={user.user_id} role={user.role}")
     await delete_doc_service(doc_id, db)
     await db.commit()
     return ResponseSchema(data={"doc_id": doc_id, "status": "deleted"})

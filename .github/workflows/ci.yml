@@ -1,5 +1,10 @@
 # ============================================================
-# CI：lint + 单元测试
+# CI：lint + 单元测试 + 镜像构建 + 依赖扫描 + 检索质量门禁
+#
+# 检索质量门禁（retrieval-gate）需要真实的 Milvus/embedding 环境，
+# 因此默认不跑；在需要它的仓库里设置变量 RAG_EVAL_ENABLED=true 并配好
+# 相应 secrets 后启用。发布流水线应设 RAG_EVAL_REQUIRED=1，
+# 让「环境不可用」也判定为失败，避免门禁被静默跳过。
 # ============================================================
 
 name: ci
@@ -33,3 +38,57 @@ jobs:
         env:
           # 测试不依赖真实基础设施；禁用外置熔断 Redis
           CIRCUIT_REDIS_ENABLED: "false"
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 只构建不推送：验证 Dockerfile 与依赖在干净环境下可复现
+      - name: Build image
+        run: docker build -t rd-knowledge-svc:ci .
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    # ★ 提示性检查：首次启用时可能报出既有的传递依赖 CVE，
+    #   这类问题需要单独排期修复，不应阻塞无关 PR。
+    #   清空基线后请把 continue-on-error 改为 false，让它真正成为门禁。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install pip-audit
+        run: python -m pip install --upgrade pip pip-audit
+
+      - name: Audit dependencies
+        run: pip-audit -r requirements.txt --desc
+
+  retrieval-gate:
+    # 需要真实检索环境；未启用时整个 job 跳过（不是失败）
+    if: ${{ vars.RAG_EVAL_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Retrieval quality gate
+        run: python scripts/eval_gate.py --dataset scripts/eval_dataset.csv
+        env:
+          MILVUS_HOST: ${{ secrets.MILVUS_HOST }}
+          MILVUS_PORT: ${{ secrets.MILVUS_PORT }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          # 发布流水线设为 1：环境不可用即失败，门禁不允许被跳过
+          RAG_EVAL_REQUIRED: ${{ vars.RAG_EVAL_REQUIRED || '0' }}

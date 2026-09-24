@@ -12,7 +12,7 @@
 from dataclasses import dataclass
 
 import jwt as pyjwt
-from fastapi import Header, HTTPException, Query
+from fastapi import Depends, Header, HTTPException, Query
 
 from src.core.config import get_settings
 from src.core.logger import logger
@@ -97,3 +97,37 @@ class PageParams:
     @property
     def offset(self) -> int:
         return (self.page - 1) * self.page_size
+
+
+def require_role(*allowed: str):
+    """生成一个「角色白名单」依赖，用于保护写操作/管理端点。
+
+    用法：`user: UserContext = Depends(require_role("admin"))`
+
+    此前项目里 role 只是一个字符串字段（`admin` 是合法值但从未被校验过），
+    删除文档这类不可逆操作只要求「已登录」。这里补上真正的权限判定。
+
+    ★ 空白名单在构造期直接报错：`require_role()` 若被放行会退化成
+    「拒绝所有人」（fail-closed，症状是线上 403 而配置看着正常），
+    而若被实现成「放行所有人」则是权限洞。与其猜，不如让调用方显式决定。
+    需要「可配置且允许为空」的场景请自行判断 `roles_from_csv(...)` 是否为空。
+    """
+    if not allowed:
+        raise ValueError("require_role() 至少要指定一个角色；若需可空配置请显式处理")
+
+    allowed_set = frozenset(allowed)
+
+    async def _checker(user: UserContext = Depends(get_current_user)) -> UserContext:
+        if user.role not in allowed_set:
+            logger.warning(
+                f"权限不足: user={user.user_id} role={user.role} 需要 {sorted(allowed_set)}"
+            )
+            raise HTTPException(status_code=403, detail="权限不足，需要更高权限角色")
+        return user
+
+    return _checker
+
+
+def roles_from_csv(raw: str) -> list[str]:
+    """把 `admin,engineer` 形式的配置解析为角色列表。"""
+    return [r.strip() for r in (raw or "").split(",") if r.strip()]

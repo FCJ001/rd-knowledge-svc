@@ -26,6 +26,9 @@ class KnowledgeDoc(BaseModel):
     category: Mapped[str | None] = mapped_column(String(100), comment="分类标签")
     business_line: Mapped[str | None] = mapped_column(String(50), comment="业务线")
     model_code: Mapped[str | None] = mapped_column(String(50), comment="车型代码")
+    # 可见角色（逗号分隔，如 "engineer,business"）。NULL=旧数据未回填（对非 admin 不可见），
+    # ""=显式仅 admin。与 Milvus chunk 级 acl_roles 数组同源，检索侧用它拼预过滤谓词。
+    acl_roles: Mapped[str | None] = mapped_column(String(255), comment="可见角色列表（逗号分隔）")
     minio_key: Mapped[str | None] = mapped_column(String(500), comment="MinIO 原始文件 key")
     page_count: Mapped[int | None] = mapped_column(Integer, comment="总页数")
     chunk_count: Mapped[int | None] = mapped_column(Integer, comment="切片数量")

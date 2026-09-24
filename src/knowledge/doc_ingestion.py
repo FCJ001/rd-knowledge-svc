@@ -37,10 +37,15 @@ async def create_ingest_record(
     category: str = "",
     business_line: str = "",
     model_code: str = "",
+    acl_roles: str = "",
     chunk_strategy: str = "fixed",
     parser: str = "mineru",
 ) -> tuple[str, str]:
-    """幂等 upsert KnowledgeDoc + 创建 queued 的 DocIngestJob。返回 (doc_id, job_id)。"""
+    """幂等 upsert KnowledgeDoc + 创建 queued 的 DocIngestJob。返回 (doc_id, job_id)。
+
+    acl_roles：API 层已解析/校验过的可见角色逗号串（""=仅 admin），这里原样
+    落库不再二次解析——解析点唯一，避免两处口径不一致。
+    """
     doc_id = compute_doc_id(doc_name)
 
     result = await db.execute(select(KnowledgeDoc).where(KnowledgeDoc.doc_name == doc_name))
@@ -51,6 +56,7 @@ async def create_ingest_record(
         existing.category = category or None
         existing.business_line = business_line or None
         existing.model_code = model_code or None
+        existing.acl_roles = acl_roles
         existing.chunk_strategy = chunk_strategy
         existing.status = "queued"
         await db.flush()
@@ -60,6 +66,7 @@ async def create_ingest_record(
             category=category or None,
             business_line=business_line or None,
             model_code=model_code or None,
+            acl_roles=acl_roles,
             chunk_strategy=chunk_strategy,
             status="queued",
         )
@@ -83,6 +90,7 @@ async def process_ingestion(
     category: str = "",
     business_line: str = "",
     model_code: str = "",
+    acl_roles: str = "",
     chunk_strategy: str = "fixed",
     parser: str = "mineru",
 ) -> str:
@@ -99,6 +107,7 @@ async def process_ingestion(
     meta = DocMetadata(
         doc_name=doc_name, doc_type=doc_type,
         category=category, business_line=business_line, model_code=model_code,
+        acl_roles=[r for r in (acl_roles or "").split(",") if r],
     )
 
     # 标记运行中（stage=parse 起点）

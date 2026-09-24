@@ -1,0 +1,16 @@
+{
+  "metrics": {
+    "hit_rate@5": 1.0,
+    "mrr": 0.961038961038961,
+    "hit_rate@20": 1.0
+  },
+  "page_metrics": {
+    "page_hit_rate@5": 1.0,
+    "page_mrr": 0.9251412429378532,
+    "page_recall@5": 0.9350282485875706
+  },
+  "dataset": "eval_dataset_draft.csv",
+  "labeled": 77,
+  "page_labeled": 59,
+  "note": "2026-09-22 三次基线。相对二次基线：RAG_DYNAMIC_TOPK 默认改为 false，证据固定 5 条 —— 页级召回 89.1%→93.5%，有据性 0.949→0.965，答案相关性 0.948→0.957，单条证据占比 33%→0%。doc 级指标不变（已到顶）。详见 runbook 4.4.3。"
+}

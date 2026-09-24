@@ -14,7 +14,8 @@ import asyncio
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -23,6 +24,7 @@ from pymilvus import DataType, Function, FunctionType, MilvusClient
 from src.core.config import get_settings
 from src.infra.milvus_client import escape_milvus_string
 from src.infra.minio_client import ensure_bucket_exists, upload_file
+from src.knowledge.acl import ACL_FIELD
 from src.rag.config import ChunkingConfig
 from src.rag.ingestion.chunkers import get_chunker, merge_short_chunks
 from src.rag.ingestion.image_summarizer import summarize_table
@@ -43,10 +45,198 @@ TABLE_HTML_RE = re.compile(r"<table\b[\s\S]*?</table>", re.IGNORECASE)
 FORMULA_BLOCK_RE = re.compile(r"\$\$[\s\S]+?\$\$")
 
 
+def _normalize_anchor(text: str) -> str:
+    """去空白用于锚点匹配（与表格/公式匹配同一套思路：忽略排版差异）"""
+    return re.sub(r"[\s\u00a0]+", "", text or "")
+
+
+# 章节归属时前向搜索的窗口（归一化字符数）
+_SECTION_SEARCH_WINDOW = 20000
+
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+
+
+def _normalize_with_pos(text: str) -> tuple[str, list[int]]:
+    """去空白并保留「归一化下标 → 原文下标」映射，用于把位置还原回原文。"""
+    out: list[str] = []
+    pos: list[int] = []
+    for i, ch in enumerate(text):
+        if not ch.isspace():
+            out.append(ch)
+            pos.append(i)
+    return "".join(out), pos
+
+
+def _heading_paths(md_text: str) -> list[tuple[int, str]]:
+    """提取 markdown 标题及其在「归一化文本」中的下标，返回 [(norm_idx, 章节路径)]。
+
+    章节路径按层级拼成 `一级 > 二级 > 三级`，用于给 chunk 补上下文锚。
+    技术文档的标题本身就是强语义信号，把它写进被索引的文本，
+    同时进入稠密与 BM25 两路。
+    """
+    norm_md, _ = _normalize_with_pos(md_text)
+    # 逐行扫原始文本，按标题层级维护栈
+    stack: list[tuple[int, str]] = []   # (level, title)
+    result: list[tuple[int, str]] = []
+    cursor = 0
+    for m in _HEADING_RE.finditer(md_text):
+        level = len(m.group(1))
+        title = m.group(2).strip()
+        if not title:
+            continue
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        stack.append((level, title))
+        # H1 通常是文档标题，与前缀里的「文档：xxx」重复，不进章节路径
+        path = " > ".join(t for lv, t in stack if lv > 1)
+        key = _normalize_anchor(title)[:20]
+        if not key:
+            continue
+        idx = norm_md.find(key, cursor)
+        if idx < 0:
+            continue
+        cursor = idx
+        result.append((idx, path))
+    return result
+
+
+def _assign_chunk_sections(chunks, md_text: str) -> list[str]:
+    """给每个 chunk 归属它所属的最后一个标题路径；无法定位则返回空串。
+
+    位置用「chunk 开头若干字符在归一化全文里的首次出现」定位，游标只前进
+    （chunk 与标题都是文档序）。定位不到就继承上一个 chunk 的章节——
+    章节归属在文档序上是单调的，继承比留空更接近真相，且不会张冠李戴。
+    """
+    if not chunks:
+        return []
+    headings = _heading_paths(md_text)
+    if not headings:
+        return [""] * len(chunks)
+
+    norm_md, _ = _normalize_with_pos(md_text)
+    out: list[str] = []
+    cursor = 0
+    last = ""
+    for chunk in chunks:
+        key = _normalize_anchor(getattr(chunk, "text", "") or "")[:40]
+        if key:
+            # ★ 限定前向窗口：无界 find 会因一次误配把游标甩到文末，
+            #   之后所有 chunk 都继承同一个章节（页码链路踩过同样的坑）。
+            #   窗口取 2 万字符 ≈ 40 个块，足够宽裕又不会跨全文乱跳。
+            idx = norm_md.find(key, cursor, cursor + _SECTION_SEARCH_WINDOW)
+            if idx >= 0:
+                cursor = idx
+                # 取最后一个起点不晚于该 chunk 的标题
+                for h_idx, path in headings:
+                    if h_idx <= idx:
+                        last = path
+                    else:
+                        break
+        out.append(last)
+    return out
+
+
+def _build_chunk_prefix(meta, section: str) -> str:
+    """构造写入被索引文本的前缀（检索用上下文锚）。
+
+    ★ 只拼进 `text`（embedding 与 BM25 的实际输入），不改 `parent_text`：
+    parent_text 是给 LLM 生成与前端展示用的，doc_name 已经在引用里出现，
+    再拼一遍是噪音。
+    """
+    parts = []
+    if meta.doc_name:
+        parts.append(f"文档：{Path(meta.doc_name).stem}")
+    if meta.doc_type:
+        parts.append(f"类型：{meta.doc_type}")
+    if meta.model_code:
+        parts.append(f"车型：{meta.model_code}")
+    if section:
+        parts.append(f"章节：{section}")
+    return f"【{'｜'.join(parts)}】\n" if parts else ""
+
+
+def _char_ngrams(text: str, n: int = 4) -> set[str]:
+    """字符级 n-gram 集合，用于容忍插入/重排的模糊匹配。
+
+    纯前缀匹配不够用：chunk 是块序列切出来的，开头可能与块的起点错位
+    （表格/公式原图注解会插进正文），前缀对不上却实际同源。
+    实测反例：chunk「这是第五章的正文内容 制动系统的补充说明」与块
+    「第五章 制动系统 这是第五章的正文内容」——前缀互不包含，但 n-gram
+    重叠 8/16，能正确判为同页。
+    """
+    if len(text) <= n:
+        return {text} if text else set()
+    return {text[i:i + n] for i in range(len(text) - n + 1)}
+
+
+def _assign_chunk_pages(
+    chunks,
+    page_anchors: list[tuple[int, str]],
+    key_chars: int = 80,
+    min_overlap: float = 0.3,
+    window: int = 150,
+    max_page_jump: int = 30,
+    confident_overlap: float = 0.8,
+) -> list[int]:
+    """把每个 chunk 映射回页码，返回与 chunks 等长的页码列表（0 = 未知）。
+
+    ★ 为什么不能用 `pages[chunk_idx]`：那两者的下标空间不同——content_list
+    的下标是「块」，chunk_idx 是「切片」，一个块可能被切成多个 chunk，
+    一个 chunk 也可能横跨多个块。用块下标取切片页码会得到看似合理却错误的
+    页码，而错误的引用比没有引用更糟，所以宁可留 0。
+
+    做法：chunk 与锚点都是文档序，用一个只前进的游标做 n-gram 重叠匹配。
+    - 取 chunk 开头若干字符的 n-gram 集合，在游标之后的**窗口内**找最优锚点；
+    - **窗口内取最佳重叠**（不是全局取最佳，也不是窗口内取首个）：
+      全局取最佳会让一次错误匹配把游标带到文末——实测 289 页手册上 727 块里
+      有 604 块因此塌到最后一页；而窗口内取首个会错配到相似锚点
+      （相邻页的标题往往只差一个编号，「章节7…」会命中「章节1…」）；
+    - **单块页码跳变守卫**：一个 chunk 不该横跨 30 页以上，超出即视为误配并
+      不推进游标。这是最后一道防线——前两道被绕过时它仍能挡住塌陷；
+    - 未命中但此前已有命中 → 沿用上一个已知页码（文档序下的合理推断）；
+    - 一个有意义的命中都没有 → 全部 0，绝不猜。
+    """
+    if not chunks:
+        return []
+    if not page_anchors:
+        return [0] * len(chunks)
+
+    anchor_grams = [_char_ngrams(_normalize_anchor(t)) for _, t in page_anchors]
+    pages: list[int] = []
+    cursor = 0
+    last_known = 0
+    matched_any = False
+    for chunk in chunks:
+        key = _normalize_anchor(getattr(chunk, "text", "") or "")[:key_chars]
+        if key:
+            key_grams = _char_ngrams(key)
+            denom = max(1, len(key_grams))
+            best_i, best_score = -1, 0.0
+            for i in range(cursor, min(cursor + window, len(page_anchors))):
+                score = len(key_grams & anchor_grams[i]) / denom
+                if score > best_score:
+                    best_score, best_i = score, i
+                if score >= 0.9:
+                    break
+            if best_i >= 0 and best_score >= min_overlap:
+                page = page_anchors[best_i][0]
+                # 软跳变守卫：低重叠加远跳 = 误配（真实远跳会近乎精确匹配）
+                wild = (matched_any and page - last_known > max_page_jump
+                        and best_score < confident_overlap)
+                if not wild:
+                    cursor = best_i
+                    last_known = page
+                    matched_any = True
+        # 一个都没匹配过时 last_known 仍是 0（未知），不制造虚假页码
+        pages.append(last_known if matched_any else 0)
+    return pages
+
+
 def _normalize_table_html(html: str) -> str:
     """去 HTML 标签与空白，用于 content_list table_body 与 md <table> 的匹配"""
     text = re.sub(r"<[^>]+>", "", html or "")
     return re.sub(r"[\s\u00a0]+", "", text)
+
 
 
 def _normalize_formula(text: str) -> str:
@@ -248,6 +438,10 @@ class DocMetadata:
     category: str = ""
     business_line: str = ""
     model_code: str = ""   # ★ 汽车域刚需：按车型过滤
+    # 可见角色（检索前 ACL 过滤依据，见 knowledge/acl.py）。
+    # 默认空 = 仅 admin 可见（检索谓词匹配不到任何角色）——fail-closed：
+    # 宁可让上传者显式声明，也不要"忘了填"变成所有人可见。
+    acl_roles: list[str] = field(default_factory=list)
 
 
 class IngestionPipeline:
@@ -292,6 +486,42 @@ class IngestionPipeline:
                     return True
         return False
 
+    def _ensure_acl_field(self) -> None:
+        """已存在的 collection 补 ACL 字段（add_collection_field，非破坏性）。
+
+        旧 collection 没有该字段时直接插入会报错；删库重建则是灾难。
+        Milvus 2.6 支持给存量 collection 增补标量字段，这里幂等补上。
+        ★ 存量行的 acl_roles 为 null，ACL 谓词匹配不到 → 对非 admin 不可见
+        （fail-closed）。必须跑 scripts/backfill_acl.py 显式赋权后存量才可见。
+        """
+        try:
+            desc = self.milvus.describe_collection(COLLECTION_NAME)
+        except Exception as e:
+            logger.warning(f"describe_collection 失败，跳过 ACL 字段检查: {e}")
+            return
+        fields = desc.get("fields") or (desc.get("schema") or {}).get("fields") or []
+        if any(f.get("name") == ACL_FIELD for f in fields):
+            return
+        try:
+            self.milvus.add_collection_field(
+                COLLECTION_NAME,
+                field_name=ACL_FIELD,
+                data_type=DataType.ARRAY,
+                element_type=DataType.VARCHAR,
+                max_capacity=16,
+                max_length=32,
+                nullable=True,
+            )
+            logger.warning(
+                f"collection '{COLLECTION_NAME}' 已补 ACL 字段 '{ACL_FIELD}'；"
+                "存量 chunk 的可见角色为空（对非 admin 不可见，fail-closed），"
+                "请运行 scripts/backfill_acl.py 为存量文档赋权"
+            )
+        except Exception as e:
+            # 字段已存在（并发实例化）不算失败；其他失败要让入库早暴露
+            if "field already exist" not in str(e).lower():
+                raise
+
     def _ensure_collection(self) -> None:
         """确保 alm_docs collection 存在，含 BM25 Function（与天宫医疗一致）。
         幂等：已存在且含 BM25 Function 则跳过；
@@ -301,6 +531,7 @@ class IngestionPipeline:
                 logger.info(
                     f"collection '{COLLECTION_NAME}' 已存在且含 BM25 Function，跳过重建"
                 )
+                self._ensure_acl_field()
                 return
             self.milvus.drop_collection(COLLECTION_NAME)
             logger.info(
@@ -315,6 +546,9 @@ class IngestionPipeline:
         schema.add_field("category", DataType.VARCHAR, max_length=100)
         schema.add_field("business_line", DataType.VARCHAR, max_length=50)
         schema.add_field("model_code", DataType.VARCHAR, max_length=50)
+        # 可见角色数组：检索前 ACL 过滤的依据（array_contains_any 谓词，见 knowledge/acl.py）
+        schema.add_field(ACL_FIELD, DataType.ARRAY,
+                         element_type=DataType.VARCHAR, max_capacity=16, max_length=32)
         schema.add_field("page_number", DataType.INT64)
         schema.add_field("chunk_index", DataType.INT64)
         schema.add_field("parent_text", DataType.VARCHAR, max_length=65535)
@@ -356,8 +590,9 @@ class IngestionPipeline:
         """返回 doc_id"""
         doc_id = hashlib.md5(meta.doc_name.encode()).hexdigest()[:16]
 
-        # 1. parse — MinerU 返回 (md_text, pages, images_dict, table_blocks, equation_blocks)
-        (md_text, pages, images, table_blocks, equation_blocks) = (
+        # 1. parse — MinerU 返回
+        # (md_text, pages, images_dict, table_blocks, equation_blocks, page_anchors)
+        (md_text, pages, images, table_blocks, equation_blocks, page_anchors) = (
             await self.parser.parse(
                 file_path,
                 return_content_list=(
@@ -408,6 +643,35 @@ class IngestionPipeline:
         if not chunks:
             raise ValueError(f"切片后无内容: {meta.doc_name}")
 
+        # ★ 页码映射：用解析期留下的页码锚点把 chunk 定位回页，
+        #   不能用 pages[chunk_idx]（块下标 ≠ 切片下标，会得到错误页码）。
+        chunk_pages = _assign_chunk_pages(chunks, page_anchors)
+        located = sum(1 for p in chunk_pages if p)
+        if page_anchors and located < len(chunks):
+            logger.warning(
+                f"页码定位部分失败: {meta.doc_name} "
+                f"{len(chunks) - located}/{len(chunks)} 个 chunk 只能沿用前一个已知页码"
+            )
+        if not any(chunk_pages):
+            logger.warning(
+                f"全部 chunk 页码未知（page_number=0）: {meta.doc_name}；"
+                "引用将不显示页码，页级评测标签也无法使用"
+            )
+
+        # ★ 章节归属 + 检索用前缀：把「哪本手册/哪个车型/哪一章」写进被索引的
+        #   text，同时进入稠密与 BM25 两路索引（contextual retrieval 的零 LLM 版）。
+        chunk_sections = _assign_chunk_sections(chunks, md_text)
+        prefixed = 0
+        for c, section in zip(chunks, chunk_sections, strict=False):
+            prefix = _build_chunk_prefix(meta, section)
+            if prefix:
+                c.text = prefix + c.text
+                prefixed += 1
+        logger.info(
+            f"上下文前缀: {prefixed}/{len(chunks)} 个 chunk 已加前缀"
+            + (f"（{sum(1 for s in chunk_sections if s)} 个定位到章节）" if prefixed else "")
+        )
+
         texts = [c.text for c in chunks]
 
         # 3. embed (only dense — sparse 由 Milvus BM25 Function 自动生成)
@@ -447,7 +711,8 @@ class IngestionPipeline:
                     "category": meta.category,
                     "business_line": meta.business_line,
                     "model_code": meta.model_code,
-                    "page_number": pages[chunk_idx] if chunk_idx < len(pages) else 0,
+                    "acl_roles": meta.acl_roles[:16],
+                    "page_number": chunk_pages[chunk_idx] if chunk_idx < len(chunk_pages) else 0,
                     "chunk_index": chunk_idx,
                     "parent_text": chunk.metadata.get("parent_text", "")[:65000],
                     "text": chunk.text[:65000],
@@ -460,7 +725,10 @@ class IngestionPipeline:
             await asyncio.to_thread(
                 self.milvus.insert, collection_name=COLLECTION_NAME, data=all_data,
             )
-            logger.info(f"入库完成: {meta.doc_name} doc_id={doc_id} chunks={len(all_data)}")
+            logger.info(
+                f"入库完成: {meta.doc_name} doc_id={doc_id} chunks={len(all_data)} "
+                f"acl_roles={meta.acl_roles or '（仅 admin 可见）'}"
+            )
 
         return doc_id
 

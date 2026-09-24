@@ -124,10 +124,57 @@ async def _parse_sync(
         return _extract_result(resp.json())
 
 
+def _block_anchor_text(b: dict) -> str:
+    """取一个 content_list 块用于定位的文本片段（不同 type 的键不同）。"""
+    for key in ("text", "table_body", "img_caption", "table_caption", "code_body"):
+        v = b.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+        if isinstance(v, list):  # img_caption 等可能是列表
+            joined = " ".join(str(x) for x in v if x)
+            if joined.strip():
+                return joined
+    return ""
+
+
+def _page_anchors_from_content_list(raw) -> list[tuple[int, str]]:
+    """从 content_list 构造页码锚点：按文档顺序的 (页码, 文本片段)。
+
+    ★ 页码统一为 1-based（MinerU 的 page_idx 是 0-based，这里 +1）。
+    0 保留给"页码未知"——若直接用 page_idx，首页的 0 会与"未知"撞值，
+    下游无法区分"第 1 页"和"没记录到页码"。
+    """
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    anchors: list[tuple[int, str]] = []
+    for b in raw if isinstance(raw, list) else []:
+        if not isinstance(b, dict):
+            continue
+        text = _block_anchor_text(b)
+        if len(text) < 8:      # 太短的片段无法可靠定位
+            continue
+        page = int(b.get("page_idx", -1) or 0) + 1
+        anchors.append((page, text))
+    return anchors
+
+
 def _extract_result(
     result: dict,
-) -> tuple[str, list[int], dict[str, bytes], list[dict], list[dict]]:
-    """从 MinerU 响应中提取 Markdown + 页码 + 图片 + 表格块 + 公式块（兼容新旧 API 格式）"""
+) -> tuple[str, list[int], dict[str, bytes], list[dict], list[dict], list[tuple[int, str]]]:
+    """从 MinerU 响应中提取 Markdown + 页码锚点 + 图片 + 表格块 + 公式块。
+
+    返回 (md, pages, images, table_blocks, equation_blocks, page_anchors)。
+
+    `pages` 是历史字段（按块顺序的页码，下标空间是「块」），保留仅为兼容；
+    **页码请用 page_anchors**——它带文本片段，可把 chunk 定位回页码。
+    用 `pages[chunk_idx]` 取页码是错的：块下标与切片下标不是同一个空间，
+    一个块可能被切成多个 chunk，一个 chunk 也可能横跨多个块。
+    """
     results = result.get("results", {})
     md = ""
     pages: list[int] = []
@@ -149,11 +196,17 @@ def _extract_result(
                                 images[img_name] = _decode_image(img_data)
                             except Exception as e:
                                 logger.warning(f"图片解码失败 {img_name}: {e}")
-                    table_blocks, equation_blocks = _parse_content_list(
-                        file_data.get("content_list")
-                    )
-                    return md, pages, images, table_blocks, equation_blocks
-        return "", [], [], [], []
+                    content_list = file_data.get("content_list")
+                    table_blocks, equation_blocks = _parse_content_list(content_list)
+                    page_anchors = _page_anchors_from_content_list(content_list)
+                    if not page_anchors:
+                        logger.warning(
+                            "MinerU 响应缺少可用的 content_list 页码锚点：本次入库所有 chunk "
+                            "的 page_number 将为 0（引用不显示页码）。请检查是否请求了 "
+                            "return_content_list，以及 content_list 是否带 page_idx"
+                        )
+                    return md, pages, images, table_blocks, equation_blocks, page_anchors
+        return "", [], {}, [], [], []
 
     # 旧版: results 是 list[dict]，有 md/blocks/images 字段
     if isinstance(results, list) and results:
@@ -161,7 +214,12 @@ def _extract_result(
         if isinstance(first, dict):
             md = first.get("md", "") or first.get("md_content", "") or ""
             blocks = first.get("blocks", [])
-            pages = [b.get("page_number", 0) for b in blocks] if blocks else []
+            pages = [int(b.get("page_number", 0) or 0) for b in blocks] if blocks else []
+            page_anchors = [
+                (int(b.get("page_number", 0) or 0) + 1, _block_anchor_text(b))
+                for b in blocks if isinstance(b, dict)
+            ]
+            page_anchors = [(pg, t) for pg, t in page_anchors if len(t) >= 8]
             raw_images = first.get("images", {})
             if isinstance(raw_images, dict):
                 for img_name, img_data in raw_images.items():
@@ -169,15 +227,15 @@ def _extract_result(
                         images[img_name] = _decode_image(img_data)
                     except Exception as e:
                         logger.warning(f"图片解码失败 {img_name}: {e}")
-            return md, pages, images, [], []
+            return md, pages, images, [], [], page_anchors
 
     # 兜底: result 本身包含 md
     if "md" in result:
-        return result["md"], [], [], [], []
+        return result["md"], [], {}, [], [], []
     if "md_content" in result:
-        return result["md_content"], [], [], [], []
+        return result["md_content"], [], {}, [], [], []
 
-    return json.dumps(result, ensure_ascii=False), [], [], [], []
+    return json.dumps(result, ensure_ascii=False), [], {}, [], [], []
 
 
 def _parse_content_list(raw) -> tuple[list[dict], list[dict]]:

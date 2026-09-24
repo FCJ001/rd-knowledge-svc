@@ -22,8 +22,9 @@ from neo4j import AsyncDriver
 from pymilvus import MilvusClient
 
 from src.core.config import get_settings
-from src.core.metrics import RETRIEVAL_LATENCY, RETRIEVAL_REQUESTS
+from src.core.metrics import RETRIEVAL_LATENCY, RETRIEVAL_OUTCOME, RETRIEVAL_REQUESTS
 from src.core.resilience import get_channel_breaker, with_retry
+from src.knowledge.acl import graph_read_allowed
 from src.knowledge.doc_rag import extract_image_urls, format_doc_context, search_docs_raw
 from src.knowledge.graph_rag import search_graph_raw
 from src.knowledge.hallucination_check import check_hallucination
@@ -31,6 +32,21 @@ from src.knowledge.prompts import FUSION_PROMPT
 from src.knowledge.query_rewriter import rewrite_query
 
 _settings = get_settings()
+
+
+class RetrievalUnavailableError(RuntimeError):
+    """全部检索通道均不可用（依赖故障）。
+
+    ★ 必须与「检索成功但没有相关内容」区分开：
+      前者是服务不可用（应答 503 + 触发监控告警），后者是知识库覆盖不足（应答"未找到"）。
+      若不区分，依赖故障会被伪装成"知识库里没有这个信息"——用户据此做出错误判断，
+      监控侧也因为没有 5xx 而完全静默。
+    """
+
+    def __init__(self, channels: list[str]) -> None:
+        self.channels = channels
+        super().__init__(f"全部检索通道不可用: {channels}")
+
 
 
 def _chatbi_headers(
@@ -80,6 +96,42 @@ async def _search_chatbi(
 def _emit(event_sink: Callable[[dict], None] | None, msg: dict) -> None:
     if event_sink is not None:
         event_sink(msg)
+
+
+def _top_doc_score(doc_hits: list[dict] | None) -> float:
+    """取文档通道 top-1 分数（优先精排分，回落融合分）。无结果显示 -1。"""
+    if not doc_hits:
+        return -1.0
+    top = doc_hits[0]
+    for key in ("rerank_score", "score"):
+        v = top.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return -1.0
+
+
+def _should_refuse(
+    doc_hits: list[dict] | None,
+    has_graph: bool,
+    has_sql: bool,
+) -> bool:
+    """是否应因置信度不足而拒答。
+
+    仅当「文档通道是唯一证据来源」且其 top-1 分数低于阈值时才拒答：
+    图谱或问数通道给出了内容时，说明确有依据，不该被文档分数压掉。
+    阈值为 0（默认）表示不启用该机制。
+    """
+    threshold = _settings.RAG_REFUSE_THRESHOLD
+    if threshold <= 0:
+        return False
+    if has_graph or has_sql:
+        return False
+    if not doc_hits:
+        return False
+    return _top_doc_score(doc_hits) < threshold
 
 
 async def _rewrite_question(
@@ -235,6 +287,10 @@ async def multi_channel_search(
     session_id: str = "default",
     owner_domain_id: int | None = None,
     business_line: str | None = None,
+    doc_type: str = "",
+    model_code: str = "",
+    top_k: int | None = None,
+    rerank_top_k: int | None = None,
     event_sink: Callable[[dict], None] | None = None,
 ) -> dict:
     """
@@ -244,11 +300,23 @@ async def multi_channel_search(
     拆分出的子查询额外走 doc_rag 并合并命中（子查询只增强文档召回，
     图谱/nl2sql 通道保持单查询 —— 多子查询会让通道成本翻倍）。
     nl2sql 通道通过 HTTP 调 rd-chatBI（CHATBI_URL），失败自动降级。
+
+    doc_type / model_code：文档过滤条件，必须一路透传到 Milvus 的 filter 表达式，
+    否则跨车型/跨文档类型的内容会互相串味（这是安全事故，不是体验问题）。
+    top_k / rerank_top_k：None 时取 Settings.RAG_TOP_K / RAG_RERANK_TOP_K。
+
+    失败语义：全部通道不可用 → 抛 RetrievalUnavailableError（调用方应答 503）；
+    部分通道失败 → 正常作答并在 status/failed_channels 里标注降级。
     event_sink: 可选回调，推流式事件：检索进度 {"type":"progress",...}、
     答案 token {"type":"delta",...}、结束 {"type":"done",...}。
     """
     if channels is None:
-        channels = ["doc_rag", "graph_rag"]
+        # ★ 默认只有文档通道。graph_rag 要求图谱真实存在，而当前 Neo4j 为空图
+        #   （0 节点 0 关系）：它在关键路径上要花 2 次 LLM 调用（抽实体 + 生成
+        #   Cypher）才能返回 0 条，且 fusion 会等所有通道 settle 才开始生成。
+        #   因此不入默认集合，由调用方显式指定后再启用。
+        channels = ["doc_rag"]
+
 
     # ── Query 改写（口语→术语 + 子查询拆分，失败降级原问题）──
     rewritten = await _rewrite_question(question, llm, role, event_sink)
@@ -260,18 +328,34 @@ async def multi_channel_search(
     if "doc_rag" in channels:
         async def _doc_channel():
             # 主查询 + 其余子查询并行召回，合并去重（增强子问题的文档覆盖）
+            # ★ doc_type/model_code 必须透传：漏传等于跨车型/跨文档类型串味
+            # ★ role 必须透传：ACL 谓词在 Milvus 检索请求里生效（检索前过滤），
+            #   在这里丢掉 role 等于整条文档通道退化成无权限检索
             hit_lists = await asyncio.gather(*[
                 search_docs_raw(
                     q, embedding_model, milvus_client,
+                    role=role,
+                    doc_type=doc_type or None,
+                    model_code=model_code or None,
+                    top_k=top_k,
+                    rerank_top_k=rerank_top_k,
                     llm=llm, use_hyde=use_hyde,
                 )
                 for q in queries
             ])
-            return _merge_doc_hits(hit_lists, limit=20)
+            return _merge_doc_hits(hit_lists, limit=top_k or _settings.RAG_TOP_K)
 
         tasks["doc_rag"] = _doc_channel
     if "graph_rag" in channels:
-        tasks["graph_rag"] = lambda: search_graph_raw(query, neo4j_driver, llm)
+        # ★ 图谱节点级 ACL 未实现（见 acl.graph_read_allowed）：非 admin 直接拒绝，
+        #   不发起检索。拒在检索之前是唯一安全的位置——该通道若放行，
+        #   LLM 生成的 Cypher 会读到全图，之后任何"结果侧过滤"都是不可信的。
+        if not graph_read_allowed(role):
+            logger.warning(f"图谱通道被拒: role={role}（节点级 ACL 未实现，fail-closed）")
+            _emit(event_sink, {"type": "progress", "channel": "graph_rag",
+                               "status": "denied", "count": 0})
+        else:
+            tasks["graph_rag"] = lambda: search_graph_raw(query, neo4j_driver, llm)
     if "nl2sql" in channels:
         tasks["nl2sql"] = lambda: _search_chatbi(
             query, role=role, session_id=session_id,
@@ -309,6 +393,16 @@ async def multi_channel_search(
             RETRIEVAL_REQUESTS.labels(channel=key, status=status).inc()
             _emit(event_sink, {"type": "progress", "channel": key, "status": status, "count": count})
 
+    # ── 通道健康度：区分「依赖故障」与「检索成功但无结果」──
+    # 全部通道失败时立刻失败，不再往下走：既避免白白调 LLM，
+    # 也避免把依赖故障伪装成"知识库里没有"（见 RetrievalUnavailableError）。
+    failed_channels = sorted(k for k, v in results.items() if v is None)
+    if results and len(failed_channels) == len(results):
+        logger.error(f"全部检索通道不可用: {failed_channels}，判定为服务降级（非空结果）")
+        RETRIEVAL_OUTCOME.labels(outcome="degraded").inc()
+        _emit(event_sink, {"type": "degraded", "failed_channels": failed_channels})
+        raise RetrievalUnavailableError(failed_channels)
+
     # ── 汇总命中情况 ──
     summary_parts = []
     doc_hits = results.get("doc_rag")
@@ -324,12 +418,15 @@ async def multi_channel_search(
         summary_parts.append(f"graph_rag={graph_count}条")
     if "nl2sql" in channels:
         summary_parts.append(f"nl2sql={'✓' if sql_ok else '✗' if sql_ok is not None else '跳过'}")
+    if failed_channels:
+        summary_parts.append(f"失败通道={failed_channels}")
     logger.info(f"多通道检索完成: {', '.join(summary_parts)}")
 
     source_parts = []
     evidence_parts = []
     retrieved_chunks = []  # 收集所有检索 chunks，供评测使用
     image_urls = []        # 文档检索命中的图片 URL，供响应层展示
+    ctx_cap = _settings.RAG_CONTEXT_MAX_CHARS
 
     if doc_hits:
         ctx = format_doc_context(doc_hits)
@@ -337,9 +434,11 @@ async def multi_channel_search(
         evidence_parts.append(ctx[:1000])
         for hit in doc_hits:
             # hit 是 dict，text 字段存储子块内容，parent_text 是完整父块
+            # ★ 这里返回的 chunks 同时是前端引用展示、缓存载荷与在线评测的上下文，
+            #   截太狠会让三处看到的都比实际生成用的上下文薄一个量级。
             text = hit.get("parent_text") or hit.get("text", "")
             if text:
-                retrieved_chunks.append(text[:500])
+                retrieved_chunks.append(text[:ctx_cap])
         image_urls = extract_image_urls(doc_hits)
 
     graph_records = results.get("graph_rag")
@@ -354,10 +453,44 @@ async def multi_channel_search(
         source_parts.append(f"### 运营数据查询结果\n{sql_answer}")
         evidence_parts.append(sql_answer[:1000])
 
+    # 走到这里说明至少有一个通道正常工作，所以"无内容"是知识库覆盖问题，
+    # 不是服务故障——这两者对用户和监控的含义完全不同。
+    status = "partial" if failed_channels else "ok"
+
     if not source_parts:
         answer = "所有检索通道均未找到与您问题相关的信息。"
-        _emit(event_sink, {"type": "done", "answer": answer, "contexts": [], "image_urls": []})
-        return {"answer": answer, "contexts": [], "image_urls": []}
+        if failed_channels:
+            answer += f"\n\n（提示：部分检索通道当前不可用：{', '.join(failed_channels)}）"
+        RETRIEVAL_OUTCOME.labels(outcome="empty").inc()
+        _emit(event_sink, {"type": "done", "answer": answer, "contexts": [], "image_urls": [],
+                           "status": "empty", "failed_channels": failed_channels})
+        return {"answer": answer, "contexts": [], "image_urls": [],
+                "status": "empty", "failed_channels": failed_channels}
+
+    # ── 低置信拒答：分数低于阈值时直接说"没有"，不调生成 LLM ──
+    # ★ 与"空结果"的区别：这里是**召回了内容但置信度不足**——正是最容易被
+    #   硬编出答案的场景。与"服务故障"的区别：依赖都正常，只是库里确实没有。
+    #   阈值需在本项目 reranker 的分数尺度上标定（见 scripts/eval_report.py
+    #   的 evaluate_score_separation / docs/runbook.md 4.4.1）。
+    if _should_refuse(doc_hits, bool(graph_records), bool(sql_answer)):
+        top = _top_doc_score(doc_hits)
+        logger.info(
+            f"低置信拒答: top_score={top:.4f} < 阈值 {_settings.RAG_REFUSE_THRESHOLD}"
+        )
+        answer = (
+            "在现有知识库中没有找到足够相关的内容来回答这个问题。\n\n"
+            "（提示：检索到了部分内容但相关度不足，为避免给出不可靠的答案，此处不作推测。"
+            "建议换一种问法，或确认该主题是否已收录。）"
+        )
+        if failed_channels:
+            answer += f"\n\n（另：部分检索通道当前不可用：{', '.join(failed_channels)}）"
+        RETRIEVAL_OUTCOME.labels(outcome="low_confidence").inc()
+        _emit(event_sink, {"type": "done", "answer": answer, "contexts": [], "image_urls": [],
+                           "status": "low_confidence", "failed_channels": failed_channels,
+                           "top_score": top})
+        return {"answer": answer, "contexts": [], "image_urls": [],
+                "status": "low_confidence", "failed_channels": failed_channels,
+                "top_score": top}
 
     sources = "\n\n".join(source_parts)
     prompt = FUSION_PROMPT.format(question=question, sources=sources, role=role)
@@ -366,7 +499,10 @@ async def multi_channel_search(
     answer = _sanitize_answer_images(answer, set(image_urls))
     # ★ 图库只返回答案真正引用的图片，与正文一一对应（不再返回全部命中图）
     image_urls = _extract_md_image_urls(answer)
-    _emit(event_sink, {"type": "done", "answer": answer, "contexts": retrieved_chunks, "image_urls": image_urls})
+    RETRIEVAL_OUTCOME.labels(outcome="ok").inc()
+    _emit(event_sink, {"type": "done", "answer": answer, "contexts": retrieved_chunks,
+                       "image_urls": image_urls, "status": status,
+                       "failed_channels": failed_channels})
 
     evidence = "\n".join(evidence_parts)
     # 幻觉检测 fail-open：超时/异常一律放行，不阻塞答案返回
@@ -390,4 +526,8 @@ async def multi_channel_search(
         "answer": answer,
         "contexts": retrieved_chunks,
         "image_urls": image_urls,
+        # status: ok=全部通道正常 / partial=有通道失败但拿到了结果
+        # failed_channels 供上层决定是否提示降级，以及写审计/指标
+        "status": status,
+        "failed_channels": failed_channels,
     }
