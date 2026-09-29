@@ -215,8 +215,19 @@ class Settings(BaseSettings):
 
     # ---------------- 数据生命周期 ----------------
     # 软删文档（status=deleted）超过该天数后被 maintenance.py retention 清理。
-    # 0 = 永久保留（默认：合规场景常常要求可追溯，不要默认删数据）。
+    # 0 = 永久保留（合规场景要求可追溯时用；生产建议设 30 天，
+    # crontab 里的 retention 任务已就绪，默认 dry-run）。
     DOC_RETENTION_DAYS: int = 0
+
+    # 源侧对账（maintenance.py reconcile）的权威源目录：目录里没有的文档
+    # 会被判为"源已消失"（dry-run 仅报告，--apply 才删）。相对路径按工作目录解析。
+    # ★ 只约束 minio_key 为空（脚本/reingest 来源）的文档；API 上传的文档
+    #   以 MinIO 对象是否存在为准，不受该目录影响。
+    RECONCILE_SOURCE_DIR: str = "data/pdfs"
+
+    # 检索期过期过滤：expire_ts 已过期的 chunk 不进候选集（谓词并进 Milvus
+    # 布尔表达式，与 ACL 同一层）。关闭仅用于排障（等价于不过滤过期文档）。
+    DOC_EXPIRE_FILTER_ENABLED: bool = True
 
     # ---------------- 查询缓存 ----------------
     QUERY_CACHE_ENABLED: bool = True       # 知识检索结果缓存（文档/图谱相对静态，安全）

@@ -47,6 +47,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"MinIO bucket 预检失败（图片上传时会重试）: {e}")
 
+    # 存量 Milvus collection 非破坏性补齐新标量字段（doc_version/pipeline_version/
+    # expire_ts，只增不删）。★ 必须在 API 进程也做：检索期过期谓词会引用
+    # expire_ts，若只靠 worker 侧入库路径补齐，"API 先升级、worker 还没跑"
+    # 的窗口内检索会因未知字段报错。
+    try:
+        import asyncio
+
+        from src.infra.milvus_client import get_milvus_client
+        from src.rag.ingestion.pipeline import ensure_schema_compat
+        await asyncio.to_thread(ensure_schema_compat, get_milvus_client())
+    except Exception as e:
+        logger.warning(f"Milvus schema 兼容检查失败（collection 不存在时由入库路径创建）: {e}")
+
     yield
 
     # ── 优雅停机：集中释放所有外部资源 ──

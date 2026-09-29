@@ -46,7 +46,8 @@ ruff check src scripts tests                   # lint
 | `DOC_RETENTION_DAYS` | 软删文档保留天数（0 = 永久保留）。大于 0 时由 maintenance 脚本清理 |
 | 轮换密钥 | 历史 HS256 密钥与 DashScope/DeepSeek key 曾入库/明文落盘，必须轮换；已泄露密钥进 `JWT_REVOKED_SECRETS` 黑名单（部署侧注入） |
 | 数据备份 | `./scripts/backup.sh`：PG 在线逻辑备份 + MinIO 对象镜像；Neo4j/Milvus 数据卷需 `COLD_BACKUP=1` 停机冷备，配 crontab 定时执行 |
-| 定时维护 | `python scripts/maintenance.py report\|compact\|retention`（crontab 建议见 runbook） |
+| 定时维护 | `python scripts/maintenance.py report\|compact\|retention\|reconcile`（crontab 建议见 runbook） |
+| 数据生命周期 | 版本化写入（先插新版本再删旧版本，失败不丢旧版）+ 内容指纹（未变更重传跳过解析；重复内容 409）+ 源侧对账 `reconcile`（源/PG/Milvus 三方 diff，默认 dry-run）+ `expire_date` 过期淡出（过期 chunk 不再召回）。详见 runbook 4.3.1 |
 | 低置信拒答 | `RAG_REFUSE_THRESHOLD`：文档通道 top-1 分数低于阈值时直接答"没有"、不调生成 LLM。默认 0（关）。**阈值必须在本项目 reranker 尺度上标定**（实测 τ=0.95），换 reranker 要重标 |
 | 重入库 | `python scripts/reingest.py --list` 看待办：改文档名、页码链路变更、切片策略变更都需重入库 |
 | `CORS_ORIGINS` | 显式 origin 列表，禁止 `*` |

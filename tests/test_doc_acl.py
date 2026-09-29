@@ -121,8 +121,8 @@ async def test_hybrid_search_admin_expr_none_keeps_filter_only():
 
 
 async def test_dense_fallback_keeps_acl(monkeypatch):
-    """hybrid 挂掉降级为 dense-only 时同样必须带 ACL——降级路径漏权限 = 一次
-    上游抖动就变成全量检索（提权）。"""
+    """hybrid 挂掉降级为 dense-only 时同样必须带 ACL 与过期过滤——降级路径
+    漏权限 = 一次上游抖动就变成全量检索（提权）；漏过期 = 召回已失效文档。"""
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("RRF 融合失败")
@@ -145,9 +145,10 @@ async def test_dense_fallback_keeps_acl(monkeypatch):
         doc_type="spec_doc",
     )
     assert hits == []
-    assert captured["filter"] == (
-        '(doc_type == "spec_doc") and (array_contains_any(acl_roles, ["engineer"]))'
-    )
+    f = captured["filter"]
+    assert '(doc_type == "spec_doc")' in f
+    assert '(array_contains_any(acl_roles, ["engineer"]))' in f
+    assert "expire_ts" in f  # 过期过滤与 ACL 同层，降级路径不豁免
 
 
 async def test_dense_fallback_admin_no_acl_clause(monkeypatch):
@@ -168,7 +169,11 @@ async def test_dense_fallback_admin_no_acl_clause(monkeypatch):
             return [0.1]
 
     await search_docs_raw("q", _FakeEmbed(), _FakeClient(), role="admin")
-    assert captured["filter"] is None
+    # admin 绕过 ACL（无 acl_roles 子句），但过期过滤是数据有效性语义、
+    # 不是权限——管理员同样不该召回已失效文档
+    f = captured["filter"]
+    assert f is None or "acl_roles" not in f
+    assert f is None or "expire_ts" in f
 
 
 def test_search_docs_role_has_no_default():

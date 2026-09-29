@@ -7,6 +7,7 @@
 # ============================================================
 
 import asyncio
+import hashlib
 import os
 import re
 import tempfile
@@ -26,7 +27,10 @@ from src.core.rate_limit import check_rate_limit
 from src.infra.db import get_db
 from src.knowledge.acl import AclConfigError, effective_acl_roles
 from src.knowledge.doc_ingestion import (
+    _set_job,
+    compute_doc_id,
     create_ingest_record,
+    parse_expire_date,
 )
 from src.knowledge.doc_ingestion import (
     delete_doc as delete_doc_service,
@@ -44,6 +48,36 @@ def _sanitize_filename(name: str) -> str:
     name = Path(name).name  # 去掉任何路径分量
     cleaned = re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", name)  # 中英文/数字/点/横线/下划线
     return cleaned or "unnamed"
+
+
+def _ingest_metadata_changed(
+    doc: KnowledgeDoc,
+    *,
+    doc_type: str,
+    category: str,
+    business_line: str,
+    model_code: str,
+    acl_roles: str,
+    chunk_strategy: str,
+    expire_date: str,
+) -> bool:
+    """同名重传时元数据是否有变。
+
+    ★ chunk 里冗余存着这些字段（ACL/车型/类型过滤读的是 Milvus 侧），
+      元数据变了必须走全量重入库——跳过管线只更新 PG 会让两侧悄悄分叉，
+      表现为"改了可见角色却不生效"（权限语义，比浪费一次解析严重得多）。
+    parser 不参与比较：KnowledgeDoc 不存 parser，换解析器的重传走全量
+    入库的诉求由 allow_duplicate/改名覆盖，此处不拦截。
+    """
+    return (
+        doc.doc_type != doc_type
+        or (doc.category or "") != (category or "")
+        or (doc.business_line or "") != (business_line or "")
+        or (doc.model_code or "") != (model_code or "")
+        or (doc.acl_roles or "") != acl_roles
+        or (doc.chunk_strategy or "fixed") != chunk_strategy
+        or (doc.expire_date or "") != (expire_date or "")
+    )
 
 
 async def _require_doc_delete_role(
@@ -97,6 +131,8 @@ async def upload_doc(
     acl_roles: str | None = None,
     chunk_strategy: str = "fixed",
     parser: str = "mineru",
+    expire_date: str = "",
+    allow_duplicate: bool = False,
     rate_limit: None = Depends(check_rate_limit),
     user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -106,6 +142,15 @@ async def upload_doc(
     acl_roles：可见角色（逗号分隔，如 `engineer,business`）。不传 = 配置默认值
     （DOC_ACL_DEFAULT_ROLES，默认仅 admin）；传空串 = 显式仅 admin。
     检索侧据此在 Milvus 查询里做检索前过滤，无权内容不进候选集。
+
+    expire_date：失效日期 YYYY-MM-DD（可选，空=永久有效）。过期后该文档
+    chunk 不再被检索召回（新版标准替代旧版时，不必删旧版也能让它淡出）。
+
+    内容指纹（SHA-256，随流式落盘一并计算）：
+    - 与其他文档内容相同 → 409 提示重复（allow_duplicate=true 可显式放行）；
+    - 与同名在库文档内容与元数据均未变 → 跳过整条解析/嵌入管线
+      （MinerU+VL+embedding 是入库最贵的一段），仅留 job 审计记录，
+      status 返回 "unchanged"。
     """
     settings = get_settings()
     if not file.filename:
@@ -119,6 +164,12 @@ async def upload_doc(
         raise HTTPException(status_code=400, detail=str(e))
     acl_roles_str = ",".join(effective_roles)
 
+    # expire_date 先验格式：非法值 400，别等到 worker 才发现
+    try:
+        parse_expire_date(expire_date)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     # ★ 扩展名白名单：入库只吃文档类文件
     raw_name = Path(file.filename).name
     suffix = Path(raw_name).suffix.lower()
@@ -127,9 +178,12 @@ async def upload_doc(
         raise HTTPException(status_code=400, detail=f"不支持的文件类型: {suffix}，允许: {' '.join(allowed)}")
 
     doc_name = _sanitize_filename(raw_name)
+    doc_id = compute_doc_id(doc_name)
 
-    # 保存到临时文件（1MB 分块流式写 + 总量上限，防大文件磁盘耗尽）
+    # 保存到临时文件（1MB 分块流式写 + 总量上限，防大文件磁盘耗尽）；
+    # ★ 同一遍流式写顺带算 SHA-256 内容指纹，不多读一个字节
     max_bytes = settings.UPLOAD_MAX_MB * 1024 * 1024
+    hasher = hashlib.sha256()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".pdf") as tmp:
         written = 0
         while chunk := await file.read(1024 * 1024):
@@ -138,10 +192,69 @@ async def upload_doc(
                 tmp.close()
                 os.unlink(tmp.name)
                 raise HTTPException(status_code=413, detail=f"文件超过大小上限 {settings.UPLOAD_MAX_MB}MB")
+            hasher.update(chunk)
             tmp.write(chunk)
         tmp_path = tmp.name
+    content_hash = hasher.hexdigest()
 
     try:
+        # ── 内容指纹决策（投递任何任务之前）──────────────────────────
+        # 1) 重复内容：不同文档命中相同 hash → 409（静默双份入库会让检索
+        #    召回两份相同内容，还各带一份引用）
+        dup = await db.execute(
+            select(KnowledgeDoc).where(
+                KnowledgeDoc.content_hash == content_hash,
+                KnowledgeDoc.doc_id != doc_id,
+                KnowledgeDoc.status != "deleted",
+            ).limit(1)
+        )
+        duplicate = dup.scalar_one_or_none()
+        if duplicate and not allow_duplicate:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"内容与已入库文档《{duplicate.doc_name}》完全相同"
+                    f"（doc_id={duplicate.doc_id}）；确要双份入库请加 allow_duplicate=true"
+                ),
+            )
+
+        # 2) 未变更重传：同 doc、同内容、同元数据且在库 → 跳过整条管线。
+        #    元数据有变不跳过（chunk 冗余存着 ACL/车型等过滤字段，见
+        #    _ingest_metadata_changed）；上次未成功入库（status≠indexed）也不跳过
+        me = await db.execute(select(KnowledgeDoc).where(KnowledgeDoc.doc_id == doc_id))
+        existing = me.scalar_one_or_none()
+        if (
+            existing is not None
+            and existing.content_hash == content_hash
+            and existing.status == "indexed"
+            and not _ingest_metadata_changed(
+                existing,
+                doc_type=doc_type, category=category, business_line=business_line,
+                model_code=model_code, acl_roles=acl_roles_str,
+                chunk_strategy=chunk_strategy, expire_date=expire_date,
+            )
+        ):
+            # 留一条 completed 的 job 审计记录（轮询方拿到的终态语义不变）
+            _, job_id = await create_ingest_record(
+                db, doc_name=doc_name, doc_type=doc_type, category=category,
+                business_line=business_line, model_code=model_code,
+                acl_roles=acl_roles_str, chunk_strategy=chunk_strategy,
+                parser=parser, content_hash=content_hash, expire_date=expire_date,
+            )
+            result = await db.execute(select(KnowledgeDoc).where(KnowledgeDoc.doc_id == doc_id))
+            doc = result.scalar_one_or_none()
+            if doc:
+                doc.status = "indexed"  # create_ingest_record 置过 queued，跳过路径还原
+            await _set_job(db, job_id, stage="completed", progress=100, doc_id=doc_id)
+            await db.commit()
+            logger.info(f"内容未变更，跳过重入库: {doc_name} doc_id={doc_id}")
+            return ResponseSchema(data=IngestResponse(
+                doc_id=doc_id,
+                doc_name=doc_name,
+                status="unchanged",
+                acl_roles=effective_roles,
+            ))
+
         # 1. 上传到 MinIO（原始文档留存，worker 从中取）
         # ★ 同步上传放线程池：大文件上传期间不冻结事件循环
         from src.infra.minio_client import get_minio_client
@@ -153,7 +266,7 @@ async def upload_doc(
         logger.info(f"MinIO 上传完成: {minio_key} size={written}")
 
         # 2. 落 queued 记录（幂等 upsert KnowledgeDoc + DocIngestJob）
-        doc_id, job_id = await create_ingest_record(
+        _, job_id = await create_ingest_record(
             db,
             doc_name=doc_name,
             doc_type=doc_type,
@@ -163,6 +276,8 @@ async def upload_doc(
             acl_roles=acl_roles_str,
             chunk_strategy=chunk_strategy,
             parser=parser,
+            content_hash=content_hash,
+            expire_date=expire_date,
         )
         result = await db.execute(select(KnowledgeDoc).where(KnowledgeDoc.doc_id == doc_id))
         doc = result.scalar_one_or_none()

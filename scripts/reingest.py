@@ -119,14 +119,18 @@ async def reingest(only: str | None) -> int:
             failed += 1
             continue
 
-        # 删除旧名文档（doc_id 由名字决定，改名等于换文档）
-        old_id = doc_id_of(e.source)
-        if existing.get(e.source):
-            await asyncio.to_thread(
-                client.delete, collection_name="alm_docs",
-                filter=f'doc_id == "{escape_milvus_string(old_id)}"',
-            )
-            print(f"  已删除旧文档: {e.source}（doc_id={old_id}）")
+        # 先全量删除旧名/同名文档的既有 chunk（doc_id 由名字决定，改名等于换文档）。
+        # ★ 管线现在是版本化写入（ingest 只清 version<meta.version 的旧块），而本
+        #   脚本每次都以 version=1 重刷——必须先清掉存量（含上次 reingest 留下的
+        #   v1 块与更早的无版本块），否则同主键重复插入会让块数翻倍。
+        for name in {e.source, e.doc_name}:
+            did = doc_id_of(name)
+            if existing.get(name):
+                await asyncio.to_thread(
+                    client.delete, collection_name="alm_docs",
+                    filter=f'doc_id == "{escape_milvus_string(did)}"',
+                )
+                print(f"  已删除既有文档: {name}（doc_id={did}）")
 
         # 复制成正确名字的临时副本再入库，源文件不动
         with tempfile.TemporaryDirectory() as td:

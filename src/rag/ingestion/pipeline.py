@@ -3,7 +3,9 @@
 #
 # ★ sparse_embedding 由 Milvus 2.6 内置 BM25 Function 自动生成
 #   与天宫医疗方案一致：无需手动计算 BM25 向量
-# 幂等：doc_id = md5(doc_name)[:16]，重复上传先删后插
+# 幂等：doc_id = md5(doc_name)[:16]；版本化写入——先插新版本 chunk
+#   （pk = {doc_id}_v{version}_{idx}），insert 确认成功后再删旧版本
+#   （doc_version < N），任何一步失败旧版本都完好可检索
 # 进度：落 doc_ingest_jobs 表
 # ★ 图片：MinerU 提取 → MinIO → markdown 引用替换为 MinIO URL
 # ============================================================
@@ -37,6 +39,103 @@ settings = get_settings()
 
 COLLECTION_NAME = "alm_docs"
 EMBEDDING_DIM = 1024
+
+# 入库管线版本：切片/页码映射/上下文前缀/嵌入模型等影响 chunk 内容的逻辑
+# 变更时必须 +1。写入每个 chunk 的 pipeline_version 字段——maintenance report
+# 据此统计"存量里还有多少块是旧管线产的"，重刷（reingest）不再是靠人记。
+PIPELINE_VERSION = 1
+
+
+def chunk_pk(doc_id: str, version: int, chunk_idx: int) -> str:
+    """chunk 主键带版本号：{doc_id}_v{version}_{chunk_idx}。
+
+    同 doc_id 重入库时每次拿新版本号，新旧 chunk 主键不冲突——这是
+    "先插新版本、确认成功后再删旧版本"的前提（先删后插在 delete 成功、
+    insert 前崩溃的窗口里会同时失去新旧两版）。
+    """
+    return f"{doc_id}_v{version}_{chunk_idx}"
+
+
+def older_versions_filter(doc_id: str, version: int) -> str:
+    """删除旧版本 chunk 的 Milvus 过滤器（新版本 insert 成功后执行）。
+
+    ★ is null 分支不可省：add_collection_field 补齐字段前的存量行
+      doc_version 为 null，而 Milvus 里 null 的数值比较（<、==）一律为
+      false——漏掉这个分支会让旧格式 id 的 chunk 永远匹配不上过滤器，
+      表现为"文档越重刷块数越多"。
+    """
+    escaped = escape_milvus_string(doc_id)
+    return (
+        f'doc_id == "{escaped}" '
+        f"&& (doc_version is null || doc_version < {version})"
+    )
+
+
+# 存量 collection 需非破坏性补齐的标量字段。一律 nullable + default_value=0：
+# 旧行读出为 0（"未标记"），避免 null 在过滤谓词里"比较恒 false"的坑。
+_COMPAT_FIELDS: list[tuple[str, dict]] = [
+    ("doc_version", {"nullable": True, "default_value": 0}),
+    ("pipeline_version", {"nullable": True, "default_value": 0}),
+    ("expire_ts", {"nullable": True, "default_value": 0}),
+]
+
+
+def _collection_field_names(client: MilvusClient) -> list[str] | None:
+    """已存在 collection 的字段名列表；describe 失败返回 None（调用方保守跳过）。"""
+    try:
+        desc = client.describe_collection(COLLECTION_NAME)
+    except Exception as e:
+        logger.warning(f"describe_collection 失败，跳过字段补齐检查: {e}")
+        return None
+    if not isinstance(desc, dict):
+        return None
+    fields = desc.get("fields") or (desc.get("schema") or {}).get("fields") or []
+    return [f.get("name") for f in fields if isinstance(f, dict)]
+
+
+def add_field_if_missing(
+    client: MilvusClient, field_name: str, data_type: DataType, **field_kwargs
+) -> bool:
+    """给存量 collection 幂等补标量字段（add_collection_field，非破坏性）。
+
+    返回本次是否补了字段；字段已存在（并发实例化）不算失败、不抛错。
+    删库重建是灾难，Schema 演进只走这条路。
+    """
+    names = _collection_field_names(client)
+    if names is None or field_name in names:
+        return False
+    try:
+        client.add_collection_field(
+            COLLECTION_NAME, field_name=field_name,
+            data_type=data_type, **field_kwargs,
+        )
+        return True
+    except Exception as e:
+        if "field already exist" not in str(e).lower():
+            raise
+        return False
+
+
+def ensure_schema_compat(client: MilvusClient) -> None:
+    """给存量 collection 补齐新标量字段（只增不删，幂等）。
+
+    API 进程启动时也要调（main.py lifespan）：检索期谓词会引用 expire_ts，
+    若字段只由 worker 侧的 IngestionPipeline._ensure_collection 补齐，
+    "API 先升级、worker 还没跑"的窗口内检索会因未知字段报错。
+    collection 不存在时静默返回——创建留给 worker 的入库路径。
+    """
+    try:
+        if not client.has_collection(COLLECTION_NAME):
+            return
+    except Exception as e:
+        logger.warning(f"milvus 不可用，跳过 schema 兼容检查: {e}")
+        return
+    for name, kwargs in _COMPAT_FIELDS:
+        if add_field_if_missing(client, name, data_type=DataType.INT64, **kwargs):
+            logger.warning(
+                f"collection '{COLLECTION_NAME}' 已补字段 '{name}'"
+                f"（存量行取默认值 0，语义见字段定义）"
+            )
 
 # 匹配 markdown 中的 HTML 表格（MinerU 复杂表格输出为 <table>）
 TABLE_HTML_RE = re.compile(r"<table\b[\s\S]*?</table>", re.IGNORECASE)
@@ -442,6 +541,11 @@ class DocMetadata:
     # 默认空 = 仅 admin 可见（检索谓词匹配不到任何角色）——fail-closed：
     # 宁可让上传者显式声明，也不要"忘了填"变成所有人可见。
     acl_roles: list[str] = field(default_factory=list)
+    # 文档版本号：同名重入库时由 process_ingestion 取"当前版本+1"传入，
+    # 写进 chunk 主键与 doc_version 字段（版本化写入的前提）。
+    version: int = 1
+    # 失效时间戳（秒，0=永久有效）：由 PG 的 expire_date 换算，检索期过滤用
+    expire_ts: int = 0
 
 
 class IngestionPipeline:
@@ -494,37 +598,31 @@ class IngestionPipeline:
         ★ 存量行的 acl_roles 为 null，ACL 谓词匹配不到 → 对非 admin 不可见
         （fail-closed）。必须跑 scripts/backfill_acl.py 显式赋权后存量才可见。
         """
-        try:
-            desc = self.milvus.describe_collection(COLLECTION_NAME)
-        except Exception as e:
-            logger.warning(f"describe_collection 失败，跳过 ACL 字段检查: {e}")
-            return
-        fields = desc.get("fields") or (desc.get("schema") or {}).get("fields") or []
-        if any(f.get("name") == ACL_FIELD for f in fields):
-            return
-        try:
-            self.milvus.add_collection_field(
-                COLLECTION_NAME,
-                field_name=ACL_FIELD,
-                data_type=DataType.ARRAY,
-                element_type=DataType.VARCHAR,
-                max_capacity=16,
-                max_length=32,
-                nullable=True,
-            )
+        added = add_field_if_missing(
+            self.milvus, ACL_FIELD, DataType.ARRAY,
+            element_type=DataType.VARCHAR, max_capacity=16, max_length=32,
+            nullable=True,
+        )
+        if added:
             logger.warning(
                 f"collection '{COLLECTION_NAME}' 已补 ACL 字段 '{ACL_FIELD}'；"
                 "存量 chunk 的可见角色为空（对非 admin 不可见，fail-closed），"
                 "请运行 scripts/backfill_acl.py 为存量文档赋权"
             )
-        except Exception as e:
-            # 字段已存在（并发实例化）不算失败；其他失败要让入库早暴露
-            if "field already exist" not in str(e).lower():
-                raise
+
+    def _ensure_compat_fields(self) -> None:
+        """已存在的 collection 补齐新标量字段（doc_version/pipeline_version/expire_ts）。
+
+        与 ACL 字段同一原则：只增不删。存量行取 default_value=0
+        （doc_version=0 的旧块可被任意 v≥1 的重入库清理；pipeline_version=0
+        即"旧管线产物"，report 据此提示重刷；expire_ts=0 即永久有效）。
+        """
+        for name, kwargs in _COMPAT_FIELDS:
+            add_field_if_missing(self.milvus, name, DataType.INT64, **kwargs)
 
     def _ensure_collection(self) -> None:
         """确保 alm_docs collection 存在，含 BM25 Function（与天宫医疗一致）。
-        幂等：已存在且含 BM25 Function 则跳过；
+        幂等：已存在且含 BM25 Function 则跳过重建；
         仅旧版 collection（无 BM25 Function）才删除重建，避免每次实例化都清空索引。"""
         if self.milvus.has_collection(COLLECTION_NAME):
             if self._collection_has_bm25():
@@ -532,6 +630,7 @@ class IngestionPipeline:
                     f"collection '{COLLECTION_NAME}' 已存在且含 BM25 Function，跳过重建"
                 )
                 self._ensure_acl_field()
+                self._ensure_compat_fields()
                 return
             self.milvus.drop_collection(COLLECTION_NAME)
             logger.info(
@@ -549,6 +648,12 @@ class IngestionPipeline:
         # 可见角色数组：检索前 ACL 过滤的依据（array_contains_any 谓词，见 knowledge/acl.py）
         schema.add_field(ACL_FIELD, DataType.ARRAY,
                          element_type=DataType.VARCHAR, max_capacity=16, max_length=32)
+        # 文档版本（同名重入库时 +1）：chunk 主键带版本实现"先插新后删旧"
+        schema.add_field("doc_version", DataType.INT64, default_value=0)
+        # 入库管线版本（PIPELINE_VERSION）：report 据此发现需要重刷的存量
+        schema.add_field("pipeline_version", DataType.INT64, default_value=0)
+        # 失效时间戳（秒，0=永久有效）：检索期过期过滤的依据（doc_rag.expiry_expr）
+        schema.add_field("expire_ts", DataType.INT64, default_value=0)
         schema.add_field("page_number", DataType.INT64)
         schema.add_field("chunk_index", DataType.INT64)
         schema.add_field("parent_text", DataType.VARCHAR, max_length=65535)
@@ -677,22 +782,15 @@ class IngestionPipeline:
         # 3. embed (only dense — sparse 由 Milvus BM25 Function 自动生成)
         dense_vecs = await dense_embedder.embed(texts)
 
-        # ★ 数量校验在删旧数据之前：嵌入部分失败（数量不符）时保留旧版本文档，
-        #   让本次入库失败可重试，而不是"旧的删了、新的进不去"
+        # ★ 数量校验在任何写入之前：嵌入部分失败（数量不符）时不动存量数据，
+        #   让本次入库失败可重试，而不是"写入一半的新版本混进检索"
         if len(dense_vecs) != len(texts):
             raise RuntimeError(
                 f"嵌入数量不符: 预期 {len(texts)} 实际 {len(dense_vecs)}，"
                 f"保留旧版本数据: {meta.doc_name}"
             )
 
-        # 幂等：解析/切片/嵌入全部成功后才删旧数据，失败时保留旧版本文档
-        await asyncio.to_thread(
-            self.milvus.delete,
-            collection_name=COLLECTION_NAME,
-            filter=f'doc_id == "{escape_milvus_string(doc_id)}"',
-        )
-
-        # 4. index (batch=50)
+        # 4. index (batch=50) —— ★ 版本化写入：先插新版本，确认成功后再删旧版本
         batch_size = 50
         all_data = []
 
@@ -704,7 +802,7 @@ class IngestionPipeline:
                 chunk_idx = i + j
                 image_urls = self._extract_image_urls(chunk.text)
                 record = {
-                    "id": f"{doc_id}_{chunk_idx}",
+                    "id": chunk_pk(doc_id, meta.version, chunk_idx),
                     "doc_id": doc_id,
                     "doc_name": meta.doc_name,
                     "doc_type": meta.doc_type,
@@ -712,6 +810,9 @@ class IngestionPipeline:
                     "business_line": meta.business_line,
                     "model_code": meta.model_code,
                     "acl_roles": meta.acl_roles[:16],
+                    "doc_version": meta.version,
+                    "pipeline_version": PIPELINE_VERSION,
+                    "expire_ts": meta.expire_ts,
                     "page_number": chunk_pages[chunk_idx] if chunk_idx < len(chunk_pages) else 0,
                     "chunk_index": chunk_idx,
                     "parent_text": chunk.metadata.get("parent_text", "")[:65000],
@@ -725,8 +826,17 @@ class IngestionPipeline:
             await asyncio.to_thread(
                 self.milvus.insert, collection_name=COLLECTION_NAME, data=all_data,
             )
+            # ★ 新版本已写入 Milvus，此刻才清旧版本——"先删后插"在 delete 成功、
+            #   insert 前崩溃的窗口里会同时失去新旧两版；反转后任何一步失败
+            #   旧版本都完好可检索，坏的新版本也能"删新留旧"回滚。
+            await asyncio.to_thread(
+                self.milvus.delete,
+                collection_name=COLLECTION_NAME,
+                filter=older_versions_filter(doc_id, meta.version),
+            )
             logger.info(
-                f"入库完成: {meta.doc_name} doc_id={doc_id} chunks={len(all_data)} "
+                f"入库完成: {meta.doc_name} doc_id={doc_id} v={meta.version} "
+                f"chunks={len(all_data)} "
                 f"acl_roles={meta.acl_roles or '（仅 admin 可见）'}"
             )
 

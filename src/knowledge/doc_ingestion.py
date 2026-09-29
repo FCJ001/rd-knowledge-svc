@@ -6,11 +6,13 @@
 #   process（worker 进程）：
 #     process_ingestion（跑管线 + 更新既有 job 进度/结果）
 #
-# 幂等：doc_id = md5(doc_name)[:16]，同名重复上传覆盖旧数据。
+# 幂等：doc_id = md5(doc_name)[:16]，同名重复上传覆盖旧数据（版本化写入：
+# 每次处理 version+1，先插新版本 chunk 再删旧版本，见 pipeline.ingest）。
 # ============================================================
 
 import asyncio
 import hashlib
+from datetime import datetime, time
 
 from loguru import logger
 from sqlalchemy import select
@@ -30,6 +32,21 @@ def compute_doc_id(doc_name: str) -> str:
     return hashlib.md5(doc_name.encode()).hexdigest()[:16]
 
 
+def parse_expire_date(raw: str | None) -> int:
+    """失效日期 YYYY-MM-DD → 当日 23:59:59（本地时区）的 epoch 秒。
+
+    空/None → 0（永久有效）；格式非法抛 ValueError（上传侧 400）。
+    取当日末尾而非零点：同日设置的过期文档在当天仍可检索，次日起淡出。
+    """
+    if not raw or not raw.strip():
+        return 0
+    try:
+        d = datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"expire_date 格式非法（应为 YYYY-MM-DD）: {raw!r}")
+    return int(datetime.combine(d, time(23, 59, 59)).timestamp())
+
+
 async def create_ingest_record(
     db: AsyncSession,
     doc_name: str,
@@ -40,11 +57,15 @@ async def create_ingest_record(
     acl_roles: str = "",
     chunk_strategy: str = "fixed",
     parser: str = "mineru",
+    content_hash: str = "",
+    expire_date: str = "",
 ) -> tuple[str, str]:
     """幂等 upsert KnowledgeDoc + 创建 queued 的 DocIngestJob。返回 (doc_id, job_id)。
 
     acl_roles：API 层已解析/校验过的可见角色逗号串（""=仅 admin），这里原样
     落库不再二次解析——解析点唯一，避免两处口径不一致。
+    content_hash：上传文件 SHA-256（内容指纹，跳过未变更重传/查重复入库）。
+    expire_date：失效日期 YYYY-MM-DD（""=永久有效），worker 处理时换算 expire_ts。
     """
     doc_id = compute_doc_id(doc_name)
 
@@ -58,6 +79,8 @@ async def create_ingest_record(
         existing.model_code = model_code or None
         existing.acl_roles = acl_roles
         existing.chunk_strategy = chunk_strategy
+        existing.content_hash = content_hash or None
+        existing.expire_date = expire_date or None
         existing.status = "queued"
         await db.flush()
     else:
@@ -68,6 +91,8 @@ async def create_ingest_record(
             model_code=model_code or None,
             acl_roles=acl_roles,
             chunk_strategy=chunk_strategy,
+            content_hash=content_hash or None,
+            expire_date=expire_date or None,
             status="queued",
         )
         db.add(doc)
@@ -97,6 +122,9 @@ async def process_ingestion(
     """worker 调用：跑完整管线，更新既有 job 的进度与 KnowledgeDoc 结果。
 
     失败抛出异常（worker 负责标记 failed / 重试 / 记指标）。
+    ★ 版本化写入：处理前取 KnowledgeDoc.version+1 传给管线。每次尝试（含
+      失败重试）都递增——重试拿新版本号，绝不与在库/残留 chunk 撞主键；
+      版本号只需单调，有空洞无碍。旧版本由管线在新版本写入成功后清理。
     """
     milvus = get_milvus_client()
     pipeline = get_ingestion_pipeline(milvus)
@@ -104,10 +132,21 @@ async def process_ingestion(
     pipeline.chunking_config = ChunkingConfig(strategy=chunk_strategy)
     pipeline.parser.parser = parser
 
+    # 元数据以 PG 为单一事实源：expire_date → expire_ts，版本号前置递增
+    result = await db.execute(select(KnowledgeDoc).where(KnowledgeDoc.doc_name == doc_name))
+    doc = result.scalar_one_or_none()
+    version = (doc.version or 0) + 1 if doc else 1
+    expire_ts = parse_expire_date(doc.expire_date) if doc else 0
+    if doc:
+        doc.version = version
+        await db.flush()
+
     meta = DocMetadata(
         doc_name=doc_name, doc_type=doc_type,
         category=category, business_line=business_line, model_code=model_code,
         acl_roles=[r for r in (acl_roles or "").split(",") if r],
+        version=version,
+        expire_ts=expire_ts,
     )
 
     # 标记运行中（stage=parse 起点）
@@ -115,9 +154,10 @@ async def process_ingestion(
 
     result_doc_id = await pipeline.ingest(file_path, meta)
 
-    # 更新 KnowledgeDoc 结果
-    result = await db.execute(select(KnowledgeDoc).where(KnowledgeDoc.doc_id == result_doc_id))
-    doc = result.scalar_one_or_none()
+    # 更新 KnowledgeDoc 结果（doc 通常已在上面取到；兜底按 doc_id 再查一次）
+    if doc is None:
+        result = await db.execute(select(KnowledgeDoc).where(KnowledgeDoc.doc_id == result_doc_id))
+        doc = result.scalar_one_or_none()
     if doc:
         doc.status = "indexed"
         doc.chunk_count = await _count_chunks(result_doc_id)
@@ -125,7 +165,7 @@ async def process_ingestion(
     # 更新 job 完成（★ 终态必须是 completed：前端/轮询方以 stage==completed 判定入库结束）
     await _set_job(db, job_id, stage="completed", progress=100, doc_id=result_doc_id)
 
-    logger.info(f"文档入库完成: {doc_name} → doc_id={result_doc_id}")
+    logger.info(f"文档入库完成: {doc_name} → doc_id={result_doc_id} v={version}")
     return result_doc_id
 
 

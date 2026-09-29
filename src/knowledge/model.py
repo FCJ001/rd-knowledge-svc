@@ -30,6 +30,12 @@ class KnowledgeDoc(BaseModel):
     # ""=显式仅 admin。与 Milvus chunk 级 acl_roles 数组同源，检索侧用它拼预过滤谓词。
     acl_roles: Mapped[str | None] = mapped_column(String(255), comment="可见角色列表（逗号分隔）")
     minio_key: Mapped[str | None] = mapped_column(String(500), comment="MinIO 原始文件 key")
+    # 文件内容 SHA-256。同名重传且内容未变时跳过整条解析/嵌入管线（省 MinerU+VL+
+    # embedding 成本）；不同文件名命中相同 hash 时上传侧 409 提示重复（可显式放行）。
+    content_hash: Mapped[str | None] = mapped_column(String(64), comment="文件内容 SHA-256 指纹")
+    # 失效日期 YYYY-MM-DD（空=永久有效）。过期后检索不再召回该文档的 chunk——
+    # 用于"新版标准生效后旧版应淡出"这类时效语义，删除不是唯一手段。
+    expire_date: Mapped[str | None] = mapped_column(String(10), comment="失效日期 YYYY-MM-DD，空=永久有效")
     page_count: Mapped[int | None] = mapped_column(Integer, comment="总页数")
     chunk_count: Mapped[int | None] = mapped_column(Integer, comment="切片数量")
     chunk_strategy: Mapped[str | None] = mapped_column(String(20), comment="切片策略: fixed/semantic/parent_child")

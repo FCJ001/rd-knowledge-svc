@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
@@ -18,6 +19,25 @@ from src.knowledge.acl import doc_acl_expr
 from src.knowledge.prompts import DOC_QA_PROMPT
 
 COLLECTION_NAME = "alm_docs"
+
+
+def expiry_expr() -> str | None:
+    """过期过滤谓词：expire_ts 已过期的 chunk 不进候选集。
+
+    ★ 与 ACL 同层进检索请求（不做结果侧过滤），理由同 acl.py——先检索
+      再丢弃会让过期内容吃掉 top_k。用于"新版标准生效后旧版应淡出"的
+      时效语义：设置 expire_date 即可，删除不是唯一手段。
+    三种"不过滤"取值都显式覆盖：
+      - is null：add_collection_field 补字段前的存量行——Milvus 里 null 的
+        数值比较恒为 false，漏掉这个分支会让存量文档全部不可见；
+      - <= 0：未设置失效（0 是 expire_ts 的默认值/未标记语义）；
+      - > now：未到失效时间。
+    DOC_EXPIRE_FILTER_ENABLED=false（排障开关）返回 None（不过滤）。
+    """
+    if not get_settings().DOC_EXPIRE_FILTER_ENABLED:
+        return None
+    now = int(time.time())
+    return f"(expire_ts is null || expire_ts <= 0 || expire_ts > {now})"
 
 
 async def search_docs_with_stages(
@@ -64,8 +84,9 @@ async def search_docs_with_stages(
     if rerank_top_k is None:
         rerank_top_k = settings.RAG_RERANK_TOP_K
 
-    # 权限谓词：在检索请求里生效（admin/关闭开关时返回 None）
+    # 权限谓词 + 过期谓词：都在检索请求里生效（admin/关闭开关时 ACL 为 None）
     acl_expr = doc_acl_expr(role)
+    exp_expr = expiry_expr()
 
     # 始终计算原始查询向量；use_hyde 时额外算 HyDE 向量作为第二路 dense
     query_vec = await embedding_model.aembed_query(question)
@@ -83,7 +104,8 @@ async def search_docs_with_stages(
 
     logger.info(
         f"DocRAG 多路召回: top_k={top_k} hyde={use_hyde} role={role} "
-        f"filter={filters or '无'} acl={acl_expr or '无（admin/已关闭）'}"
+        f"filter={filters or '无'} acl={acl_expr or '无（admin/已关闭）'} "
+        f"expire_filter={'开' if exp_expr else '关'}"
     )
 
     hits = []
@@ -98,10 +120,11 @@ async def search_docs_with_stages(
             top_k=top_k,
             filters=filters or None,
             extra_dense_queries=extra_dense_queries,
+            extra_expr=exp_expr,
         )
     except Exception as e:
         # 降级：RRF 混合检索失败 → 回退旧 dense-only 检索，再失败返回 []
-        # ★ 降级路径同样必须带 ACL：漏带等于"hybrid 一挂就提权"
+        # ★ 降级路径同样必须带 ACL 与过期过滤：漏带等于"hybrid 一挂就提权/召回过期内容"
         logger.warning(f"混合检索失败，降级为 dense-only: {e}")
         try:
             from src.infra.milvus_client import escape_milvus_string
@@ -111,7 +134,7 @@ async def search_docs_with_stages(
                 filter_parts.append(f'doc_type == "{escape_milvus_string(doc_type)}"')
             if model_code:
                 filter_parts.append(f'model_code == "{escape_milvus_string(model_code)}"')
-            filter_expr = _and_expr(" and ".join(filter_parts), acl_expr) or None
+            filter_expr = _and_expr(" and ".join(filter_parts), acl_expr, exp_expr) or None
             results = await asyncio.to_thread(
                 milvus_client.search,
                 collection_name=COLLECTION_NAME,

@@ -21,6 +21,7 @@ async def hybrid_search(
     top_k: int = 20,
     filters: dict | None = None,
     extra_dense_queries: list[list[float]] | None = None,
+    extra_expr: str | None = None,
 ) -> list[dict]:
     """Dense + BM25 混合检索（RRF 融合）。
 
@@ -31,9 +32,14 @@ async def hybrid_search(
     acl_expr: 权限谓词（见 knowledge/acl.py），并进每个 AnnSearchRequest 的
     布尔表达式。★ 无默认值：必须显式给出——None 的语义是"已确认本次查询
     无需 ACL 约束"（admin 或 DOC_ACL_ENABLED=false），不是"忘了传"。
+    extra_expr: 其他检索期谓词（如过期过滤 doc_rag.expiry_expr），与 ACL
+    同层进请求——同样的理由：RRF 融合发生在过滤之后，被过滤内容既不占
+    top_k，也不会经融合进入结果。
     RRF 融合发生在过滤之后，所以无权内容既不占 top_k，也不会经融合进入结果。
     """
-    filter_expr = _and_expr(_build_filter(filters) if filters else "", acl_expr)
+    filter_expr = _and_expr(
+        _build_filter(filters) if filters else "", acl_expr, extra_expr,
+    )
 
     dense_req = AnnSearchRequest(
         data=[dense_embedding],
